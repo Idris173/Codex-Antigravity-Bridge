@@ -1,0 +1,14 @@
+# Compiled binaries & Python cache
+*.dll
+*.pdb
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state & backups
+session_lock.json
+*.mutex
+*.bak*
+*.tmp*
+bus/
+pending_nav.json
