@@ -160,8 +160,13 @@ def json_bytes(value):
     return (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
 
 
-def load_json(data):
-    result = json.loads(data.decode("utf-8-sig")) if data is not None else {}
+def load_json(data, *, allow_blank=False):
+    if data is None:
+        return {}
+    source = data.decode("utf-8-sig")
+    if allow_blank and not source.strip():
+        return {}
+    result = json.loads(source)
     if not isinstance(result, dict):
         raise ValueError("MCP JSON configuration must contain an object.")
     return result
@@ -283,7 +288,7 @@ def merge_registration(servers, name, server, role, entry):
 
 
 def edit_json(original, server, entry, state):
-    config = load_json(original)
+    config = load_json(original, allow_blank=True)
     servers = configuration_map(config, "mcpServers")
     if entry is not None:
         entry = merge_registration(servers, AGY, server, "antigravity", entry)
@@ -465,7 +470,7 @@ def plans(layout, python=None):
     if python is not None and state_bytes is None:
         state = {
             "gemini_existed": original_json is not None,
-            "gemini_map_existed": "mcpServers" in load_json(original_json),
+            "gemini_map_existed": "mcpServers" in load_json(original_json, allow_blank=True),
             "codex_existed": original_toml is not None,
             "codex_map_existed": "mcp_servers" in tomllib.loads((original_toml or b"").decode("utf-8")),
         }
