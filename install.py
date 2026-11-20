@@ -19,7 +19,8 @@ import tomllib
 from dataclasses import dataclass
 
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py",
+                "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
 SKILL_NAME = "codex-antigravity-bridge"
@@ -29,9 +30,11 @@ TOOLS = {
     AGY: {
         "bridge_inspect_app", "bridge_bind_session", "bridge_dispatch_task", "bridge_dispatch_status",
         "bridge_read_latest", "bridge_create_project_session", "bridge_unbind_session",
-        "bridge_check_codex_inbox", "bridge_reply_to_codex", "bridge_routing_settings",
+        "bridge_check_codex_inbox", "bridge_reply_to_codex", "bridge_routing_settings", "bridge_claim_codex_request",
+        "bridge_codex_session_model",
     },
-    CODEX: {"agy_submit_for_review", "agy_fetch_director_reply", "agy_bridge_status", "agy_routing_settings"},
+    CODEX: {"agy_submit_for_review", "agy_fetch_director_reply", "agy_bridge_status", "agy_routing_settings",
+            "agy_workspace_pair", "agy_cancel_guarded_review"},
 }
 TEXT = {
     "en": {
@@ -190,7 +193,7 @@ def antigravity_notification_edits(layout, python=None, workspace=None, conversa
         sidecars[AGY] = {**configuration_map(sidecars, AGY), "enabled": True}
         updated_manifest = json_bytes({
             "display_name": "Codex Bridge Inbox",
-            "description": "Notifies a selected Antigravity conversation of new Codex messages.",
+            "description": "Notifies verified workspace conversations of new Codex messages.",
             "command": str(python),
             "args": ["-B", script, *target, since],
         })
@@ -205,6 +208,42 @@ def antigravity_notification_edits(layout, python=None, workspace=None, conversa
         (manifest, original_manifest, updated_manifest),
         (config_path, original_config, updated_config),
     ]
+
+
+def antigravity_hook_edits(layout, python=None):
+    path = layout.check_path(layout.antigravity_config.with_name("hooks.json"))
+    original = read_bytes(path)
+    hooks = load_json(original)
+    key = "codex-antigravity-bridge-model"
+    script = str(layout.bridge / "agy_model_guard.py")
+    current = hooks.get(key)
+    owned = isinstance(current, dict) and any(
+        isinstance(handler, dict) and script in handler.get("command", "")
+        for handler in current.get("PreInvocation", [])
+    )
+    if current is not None and not owned:
+        if python is None:
+            return []
+        raise ValueError("The bridge model hook name is already in use.")
+    if python is None:
+        if current is None:
+            return []
+        del hooks[key]
+    else:
+        def command(action):
+            return {"type": "command", "command": subprocess.list2cmdline([str(python), "-B", script, action]),
+                    "timeout": 10}
+
+        hooks[key] = {
+            "PreInvocation": [command("pre-invocation")],
+            "PreToolUse": [{
+                "matcher": ".*(?:call_mcp_tool|bridge_claim_codex_request|bridge_reply_to_codex)$",
+                "hooks": [command("pre-tool")],
+            }],
+        }
+    if hooks == load_json(original):
+        return []
+    return [(path, original, json_bytes(hooks) if hooks else None)]
 
 
 def configuration_map(config, key):
@@ -546,6 +585,8 @@ def install(layout, python, workspace=None, conversation_id=None):
     state, edits = plans(layout, python)
     if conversation_id:
         edits.extend(antigravity_notification_edits(layout, python, workspace, conversation_id))
+    if conversation_id or layout.antigravity_sidecar.is_file():
+        edits.extend(antigravity_hook_edits(layout, python))
     confirm_python(python)
     changed = copy_assets(layout)
     dll_ok = compile_dll(layout, changed)
@@ -562,6 +603,7 @@ class LockedBridgeLibrary(PermissionError):
 def uninstall(layout):
     _, edits = plans(layout)
     edits.extend(antigravity_notification_edits(layout))
+    edits.extend(antigravity_hook_edits(layout))
     owns_installation = layout.state.is_file() or any(old != new for _, old, new in edits)
     if not owns_installation:
         return []
@@ -580,16 +622,20 @@ def uninstall(layout):
     files = [bridge / name for name in (*BRIDGE_FILES, "session_lock.json", "session_lock.mutex", "director_settings.mutex")]
     bindings = layout.check_path(bridge / "bindings")
     files.extend(bindings / name for name in ("bindings.mutex", "ui_inject.mutex"))
+    files.extend(path for path in bindings.glob("*.run.mutex") if re.fullmatch(r"[A-Za-z0-9_.-]+\.run\.mutex", path.name))
     files.extend(path for path in bindings.glob("*.json") if re.fullmatch(r"[A-Za-z0-9_.-]+\.json", path.name))
     files.extend(path for path in bindings.glob(".tmp_last_msg_*.txt"))
     bus = layout.check_path(bridge / "bus")
     requests = layout.check_path(bus / "requests")
     dispatches = layout.check_path(bus / "dispatches")
+    deliveries = layout.check_path(bus / "deliveries")
     files.extend(path for path in dispatches.glob("*.json") if re.fullmatch(r"[0-9a-f]{32}(?:\.execution)?\.json", path.name))
-    files.extend(bus / name for name in ("to_antigravity.json", "to_codex_latest.json", "replies.mutex", "antigravity_notifications.json"))
+    files.extend(bus / name for name in ("to_antigravity.json", "to_codex_latest.json", "replies.mutex",
+                                        "antigravity_notifications.json", "workspace_routes.json", "workspace_routes.mutex"))
+    files.extend(path for path in deliveries.glob("*.json") if re.fullmatch(r"(?:req_\d+_[0-9a-f]{6,32}|active_[A-Za-z0-9-]+)\.json", path.name))
     files.extend(path for path in requests.glob("req_*.json") if re.fullmatch(r"req_\d+_[0-9a-f]{6,32}\.json", path.name))
     files.extend(path for path in bus.glob("to_codex_req_*.json") if re.fullmatch(r"to_codex_req_\d+_[0-9a-f]{6,32}\.json", path.name))
-    directories = {bridge, bindings, bus, requests, dispatches}
+    directories = {bridge, bindings, bus, requests, dispatches, deliveries}
     for source, destination in layout.skills:
         layout.check_path(destination)
         directories.add(destination)
@@ -688,6 +734,16 @@ def doctor(layout):
     script_paths = [layout.check_path(layout.bridge / file) for file in BRIDGE_FILES]
     bridge_ok = all(read_bytes(path) == (SOURCE / "bridge" / path.name).read_bytes() for path in script_paths)
     result("bridge_files", bridge_ok, path=str(layout.bridge))
+    if layout.antigravity_sidecar.is_file():
+        try:
+            registration = load_json(read_bytes(layout.gemini))["mcpServers"][AGY]
+            python = Path(registration["command"])
+            pending_edits = antigravity_hook_edits(layout, python)
+            hooks = layout.antigravity_config.with_name("hooks.json")
+            enabled_hook = load_json(read_bytes(hooks)).get("codex-antigravity-bridge-model", {}).get("enabled", True)
+            result("antigravity_model_hook", not pending_edits and enabled_hook, path=str(hooks))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result("antigravity_model_hook", False, error=type(error).__name__)
     dll = layout.check_path(layout.bridge / "BridgeFastUia.dll")
     try:
         run_powershell(CHECK_DLL, {"CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(dll)})

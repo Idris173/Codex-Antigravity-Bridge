@@ -383,19 +383,233 @@ class BridgeLogicTests(TemporaryHomeTest):
                 "request_id": request_id, "status": "pending", "workspace_path": str(submitted_from),
                 "step_summary": "Read it through MCP",
             })
-        with mock.patch.multiple(notify_inbox, BUS_DIR=bus, tool_check_codex_inbox=self.bridge.tool_check_codex_inbox):
-            with mock.patch.object(notify_inbox.subprocess, "run", side_effect=[OSError("not ready"), None]) as send:
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bus, bridge=self.bridge,
+                                 tool_check_codex_inbox=self.bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call", side_effect=[
+                OSError("not ready"), {"sendMessage": {"recipientId": conversation_id}},
+            ]) as send:
                 args = (str(workspace), conversation_id, 10, "agentapi")
-                with self.assertRaises(OSError):
-                    notify_inbox.notify_pending(*args)
+                self.assertIsNone(notify_inbox.notify_pending(*args))
+                self.assertEqual(self.bridge._delivery_status("req_11_aabbcc")["status"], "notification_failed")
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(notify_inbox.notify_pending(*args), "req_11_aabbcc")
                 self.assertIsNone(notify_inbox.notify_pending(*args))
             self.assertEqual(send.call_count, 2)
-            command = send.call_args.args[0]
-            self.assertEqual(command[:3], ["agentapi", "send-message", conversation_id])
+            command = send.call_args.args
+            self.assertEqual(command[:3], ("agentapi", "send-message", conversation_id))
             self.assertIn("req_11_aabbcc", command[3])
             self.assertNotIn("Read it through MCP", command[3])
+
+    def test_late_receipt_is_notified_by_queued_time_after_workspace_pairing(self):
+        from bridge import notify_inbox
+
+        workspace = self.layout.home
+        cid = "12345678-1234-1234-1234-123456789abc"
+        request_id = "req_3_aabbcc"
+        bridge = self.bridge
+        paired = bridge.tool_workspace_pair("link", str(workspace), cid)
+        self.assertEqual(paired["route"]["status"], "verifying")
+        bridge._atomic_write_json(bridge._request_path(request_id), {
+            "request_id": request_id, "status": "pending", "workspace_path": str(workspace),
+            "queued_at_ms": paired["route"]["since_ms"] + 1,
+        })
+        meta = {"conversationMetadata": {"metadata": {"workspaceUris": [workspace.as_uri()], "projectId": "project"}}}
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call", side_effect=[
+                meta, {"sendMessage": {"recipientId": cid}},
+            ]):
+                notify_inbox.reconcile_routes("agentapi")
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(notify_inbox.notify_pending(str(workspace), cid, 100, "agentapi"), request_id)
+        self.assertEqual(bridge.tool_workspace_pair("get", str(workspace))["route"]["status"], "confirmed")
+        self.assertEqual(bridge._delivery_status(request_id)["status"], "notified")
+
+    def test_parent_route_does_not_override_the_installed_workspace_target(self):
+        from bridge import notify_inbox
+
+        bridge = self.bridge
+        workspace = self.layout.home / "installed workspace"
+        installed = "12345678-1234-1234-1234-123456789abc"
+        parent = "12345678-1234-1234-1234-123456789def"
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
+            str(self.layout.home): {"workspace_path": str(self.layout.home), "conversation_id": parent,
+                                    "since_ms": 0, "status": "confirmed"},
+        })
+        request_id = "req_10_aabbcc"
+        bridge._atomic_write_json(bridge._request_path(request_id), {
+            "request_id": request_id, "status": "pending", "workspace_path": str(workspace), "queued_at_ms": 10,
+        })
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call",
+                                   return_value={"sendMessage": {"recipientId": installed}}) as send:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(notify_inbox.notify_pending(str(workspace), installed, 0, "agentapi"), request_id)
+                self.assertEqual(send.call_args.args[2], installed)
+
+    def test_open_keeps_confirmed_route_until_new_conversation_is_verified(self):
+        from bridge import notify_inbox
+
+        bridge = self.bridge
+        workspace = self.layout.home
+        old = "12345678-1234-1234-1234-123456789abc"
+        new = "12345678-1234-1234-1234-123456789def"
+        bridge.tool_workspace_pair("link", str(workspace), old)
+        meta = {"conversationMetadata": {"metadata": {"workspaceUris": [workspace.as_uri()], "projectId": "project"}}}
+        creation = {"newConversation": {"conversationId": new}}
+        wrong_meta = {"conversationMetadata": {"metadata": {"workspaceUris": [], "projectId": "project"}}}
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call", side_effect=[
+                meta, creation, wrong_meta, creation, meta,
+            ]) as native:
+                notify_inbox.reconcile_routes("agentapi")
+                existing = bridge.tool_workspace_pair("get", str(workspace))["route"]
+                opening = bridge.tool_workspace_pair("open", str(workspace))["route"]
+                self.assertEqual(opening, {**existing, "open_attempt": {"status": "opening"}})
+                self.assertEqual(bridge.tool_workspace_pair("open", str(workspace))["route"], opening)
+                notify_inbox.reconcile_routes("agentapi")
+                failed = bridge.tool_workspace_pair("get", str(workspace))["route"]
+                self.assertEqual(failed.pop("open_attempt"), {
+                    "status": "blocked", "error_code": "ANTIGRAVITY_SIDECAR_PROJECT_MISMATCH",
+                })
+                self.assertEqual(failed, existing)
+                self.assertEqual(native.call_count, 1)
+
+                bridge._atomic_write_json(bridge.BASE_DIR.parent.parent / "config.json", {
+                    "sidecars": {"chatgpt-bridge": {"projectId": "project"}},
+                })
+                bridge.tool_workspace_pair("open", str(workspace))
+                notify_inbox.reconcile_routes("agentapi")
+                failed = bridge.tool_workspace_pair("get", str(workspace))["route"]
+                self.assertEqual(failed.pop("open_attempt"), {
+                    "status": "blocked", "error_code": "ANTIGRAVITY_WORKSPACE_UNCONFIRMED",
+                })
+                self.assertEqual(failed, existing)
+
+                bridge.tool_workspace_pair("open", str(workspace))
+                notify_inbox.reconcile_routes("agentapi")
+                opened = bridge.tool_workspace_pair("get", str(workspace))["route"]
+                self.assertEqual(opened["conversation_id"], new)
+                self.assertEqual(opened["status"], "confirmed")
+                self.assertNotIn("open_attempt", opened)
+
+    def test_model_guard_requires_host_proof_for_claim_and_reply(self):
+        from bridge import agy_model_guard as guard, notify_inbox
+
+        bridge = self.bridge
+        workspace = self.layout.home
+        cid = "12345678-1234-1234-1234-123456789abc"
+        args = {"workspace_path": str(workspace), "required_model": "gemini-4-neon",
+                "target_conversation_id": cid, "step_summary": "Guarded task payload"}
+        self.assertEqual(bridge.codex_tool_submit_for_review(**args)["error_code"], "ANTIGRAVITY_TARGET_UNCONFIRMED")
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
+            os.path.normcase(str(workspace)): {"workspace_path": str(workspace), "conversation_id": cid,
+                                              "status": "confirmed", "since_ms": 0},
+        })
+        sent = bridge.codex_tool_submit_for_review(**args)
+        request_id = sent["request_id"]
+        inbox = bridge.tool_check_codex_inbox(request_id)
+        self.assertNotIn("Guarded task payload", json.dumps(inbox))
+        event = {"toolCall": {"name": "mcp__chatgpt-bridge__bridge_claim_codex_request",
+                             "args": {"request_id": request_id}},
+                 "conversationId": cid, "modelName": "gemini-4-hydrogen-tiered-high"}
+        with mock.patch.object(guard, "bridge", bridge):
+            self.assertEqual(guard.pre_tool({**event, "conversationId": "another"})["reason"], "ANTIGRAVITY_TARGET_MISMATCH")
+            self.assertEqual(guard.pre_tool(event)["reason"], "ANTIGRAVITY_MODEL_MISMATCH")
+            self.assertEqual(bridge.codex_tool_fetch_director_reply(request_id)["delivery"]["status"], "blocked")
+            self.assertFalse(bridge.tool_claim_codex_request(request_id)["ok"])
+            event["modelName"] = "gemini-4-neon-tiered-high"
+            wrapped = {**event, "toolCall": {"name": "call_mcp_tool", "args": {
+                "ServerName": '"chatgpt-bridge"', "ToolName": '"bridge_claim_codex_request"',
+                "Arguments": json.dumps({"request_id": request_id}),
+            }}}
+            proof = json.loads(guard.pre_tool(wrapped)["overwrite"]["Arguments"])["model_proof"]
+            self.assertNotIn(proof, json.dumps(bridge.codex_tool_fetch_director_reply(request_id)))
+            second = bridge.codex_tool_submit_for_review(**args)["request_id"]
+            second_event = {**event, "toolCall": {**event["toolCall"], "args": {"request_id": second}}}
+            raced_proof = guard.pre_tool(second_event)["overwrite"]["model_proof"]
+            claim = bridge.tool_claim_codex_request(request_id, proof)
+            self.assertEqual(claim["submission"]["step_summary"], args["step_summary"])
+            claimed = dict(bridge._delivery_status(request_id))
+            self.assertEqual(bridge.tool_claim_codex_request(request_id, proof)["error_code"],
+                             "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED")
+            duplicate = guard.pre_tool({**event, "modelName": "gemini-4-neon-low"})
+            self.assertEqual(duplicate["reason"], "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED")
+            self.assertEqual(bridge._delivery_status(request_id), claimed)
+            self.assertEqual(bridge.tool_claim_codex_request(second, raced_proof)["error_code"],
+                             "ANTIGRAVITY_CONVERSATION_BUSY")
+            self.assertEqual(guard.pre_tool(second_event)["reason"], "ANTIGRAVITY_CONVERSATION_BUSY")
+            second_state = bridge._read_json_safe(bridge._delivery_path(second))
+            self.assertNotIn("claim_proof", second_state)
+            self.assertEqual(second_state["status"], "queued")
+            self.assertTrue(bridge.codex_cancel_guarded_review(second)["ok"])
+            self.assertTrue(bridge._active_model_path(cid).is_file())
+            self.assertFalse(bridge.codex_cancel_guarded_review(request_id)["ok"])
+
+            wrong_model = {**event, "modelName": "gemini-4-carbon-medium"}
+            self.assertEqual(guard.pre_invocation(wrong_model)["terminationBehavior"], "terminate")
+            self.assertEqual(bridge._delivery_status(request_id)["status"], "blocked")
+            with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                     tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+                with mock.patch.object(notify_inbox, "native_call") as send:
+                    self.assertIsNone(notify_inbox.notify_pending(str(workspace), cid, 0, "agentapi"))
+                    send.assert_not_called()
+            self.assertEqual(guard.pre_invocation(event), {})
+            recovered = bridge._delivery_status(request_id)
+            self.assertEqual(recovered["status"], "claimed")
+            self.assertNotIn("error_code", recovered)
+            self.assertFalse(bridge.tool_reply_to_codex(request_id, review_feedback="Done")["ok"])
+            wrapped_reply = {**event, "toolCall": {"name": "call_mcp_tool", "args": {
+                "ServerName": '"chatgpt-bridge"', "ToolName": '"bridge_reply_to_codex"',
+                "Arguments": json.dumps({"review_feedback": "Done"}),
+            }}}
+            reply_args = json.loads(guard.pre_tool(wrapped_reply)["overwrite"]["Arguments"])
+            self.assertEqual(reply_args["request_id"], request_id)
+            reply = bridge.tool_reply_to_codex(**reply_args)
+            self.assertEqual(reply["reply"]["execution_model"], event["modelName"])
+            self.assertEqual(bridge.codex_tool_fetch_director_reply(request_id)["status"], "replied")
+            self.assertFalse(bridge._active_model_path(cid).exists())
+
+            third = bridge.codex_tool_submit_for_review(**args)["request_id"]
+            third_event = {**event, "toolCall": {**event["toolCall"], "args": {"request_id": third}}}
+            token = guard.pre_tool(third_event)["overwrite"]["model_proof"]
+            self.assertTrue(bridge.tool_claim_codex_request(third, token)["ok"])
+            self.assertEqual(guard.pre_invocation(wrong_model)["terminationBehavior"], "terminate")
+            self.assertTrue(bridge.codex_cancel_guarded_review(third)["ok"])
+            self.assertEqual(bridge.codex_tool_fetch_director_reply(third)["status"], "cancelled")
+            self.assertFalse(bridge._active_model_path(cid).exists())
+            self.assertEqual(guard.pre_invocation(wrong_model), {})
+
+    def test_headless_reuses_exact_workspace_and_defaults_to_natural(self):
+        bridge = self.bridge
+        initial = bridge.tool_bind_session(workspace_path=str(self.layout.home), reuse_workspace_binding=True)
+        reused = bridge.tool_bind_session(workspace_path=str(self.layout.home / "."), reuse_workspace_binding=True)
+        self.assertEqual(initial["binding_id"], reused["binding_id"])
+        self.assertTrue(reused["reused"])
+        with mock.patch.object(bridge.HeadlessCodexRunner, "dispatch", return_value={
+            "ok": True, "raw_reply": "完成了。",
+        }) as dispatch:
+            result = bridge.tool_dispatch_task("查看工作区", "只读查看当前目录。",
+                                              binding_id=reused["binding_id"], wait_for_result=False)
+        self.assertNotIn("[DIRECTOR_TASK]", dispatch.call_args.kwargs["envelope"])
+        self.assertEqual(dispatch.call_args.kwargs["timeout_sec"], 0)
+        self.assertEqual(result["parsed_reply"]["summary"], "完成了。")
+
+    def test_codex_model_update_is_per_binding(self):
+        bridge = self.bridge
+        first = bridge.tool_bind_session(workspace_path=str(self.layout.home))
+        second = bridge.tool_bind_session(workspace_path=str(self.layout.home))
+        with mock.patch.object(bridge, "_codex_catalog", return_value=[
+            {"slug": "gpt-6.2-sol"}, {"slug": "gpt-6.2-astra"},
+        ]):
+            changed = bridge.tool_codex_session_model(first["binding_id"], "set", "gpt-6.2-astra")
+            self.assertEqual(changed["next_model"], "gpt-6.2-astra")
+            self.assertIsNone(bridge.tool_codex_session_model(second["binding_id"])["next_model"])
+            self.assertEqual(bridge.tool_codex_session_model(first["binding_id"], "set", "unknown")["error_code"],
+                             "CODEX_MODEL_UNAVAILABLE")
+            self.assertEqual(bridge.tool_codex_session_model(first["binding_id"])["next_model"], "gpt-6.2-astra")
 
     def test_routing_catalog_reads_isolated_cache_and_persists_profiles(self):
         home = self.layout.codex.parent
@@ -569,6 +783,8 @@ class BridgeLogicTests(TemporaryHomeTest):
         echo = self.bridge.build_director_envelope("general", "goal", "instructions\n[SUMMARY]\n[FILES]")
         self.assertFalse(self.bridge.parse_worker_reply(echo)["structured_protocol_matched"])
         self.assertFalse(self.bridge.parse_worker_reply("Echo mentioning [SUMMARY] and [FILES]")["structured_protocol_matched"])
+        self.assertEqual(self.bridge.parse_worker_reply("[SUMMARY]\nA legacy summary.")["summary"],
+                         "A legacy summary.")
         reply = echo + "\r\n## [SUMMARY]\r\nactual reply\r\n[FILES]\r\nbridge/bridge_server.py\r\n[OPEN_QUESTIONS]\r\nNONE\r\n"
         result = self.bridge.parse_worker_reply(reply)
         self.assertTrue(result["structured_protocol_matched"])

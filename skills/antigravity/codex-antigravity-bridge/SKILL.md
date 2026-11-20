@@ -1,12 +1,12 @@
 ---
 name: codex-antigravity-bridge
 description: >-
-  Use this skill ONLY when the user explicitly asks to direct, command, orchestrate, or take over a local ChatGPT or Codex desktop session for game development (Unreal Engine or Three.js). Do NOT activate during regular conversations, standalone coding, or design discussions unless the user explicitly instructs you to command ChatGPT/Codex.
+  Exchange messages, tasks, and results between Antigravity and Codex when the user requests cross-app collaboration.
 ---
 
-# Codex-Antigravity-Bridge — Antigravity 技术总监
+# Codex-Antigravity-Bridge — Antigravity
 
-你在此工作流中担任**游戏项目的技术总监（Tech Director & Reviewer）**，在制作人（用户）授权下，通过本地 `chatgpt-bridge` MCP 极速中转接口指挥本机打开的指定 **ChatGPT / Codex 桌面会话（执行端 `codex-antigravity-bridge`）** 完成开发、审查代码、提出修改意见并推进下一步。
+用户明确要求时，通过本地 `chatgpt-bridge` MCP 与指定 Codex 会话交换任务和结果。用自然语言向另一端说明目标、限制和验收条件，把会话编号和请求编号留给工具调用。
 
 ---
 
@@ -48,11 +48,14 @@ description: >-
 
 ### 路径 C：同一任务多轮迭代期间（零重复探测直发）
 - 一旦已通过 `bridge_bind_session` 加锁，后续连续派发子步骤或打回返工时，**严禁重复调用 `bridge_inspect_app` 或 `bridge_bind_session`**，直接携带 `binding_id` 调用 `bridge_dispatch_task`。
-- 若返回 `timed_out: true, reply_confirmed: false`，可稍后调用 `bridge_read_latest` 取回回复。若返回 `DAEMON_EXEC_UNCERTAIN`，先按原 `dispatch_id` 核实会话状态，再决定是否重新派发。
+- 无头模式可用 `wait_for_result=false` 取得派发编号，然后用 `bridge_dispatch_status` 读取同一任务的结果。同一绑定仍在运行时等待该任务结束再发下一轮。
+- 复用同一目录可在 `bridge_bind_session` 传 `reuse_workspace_binding=true`。若用户要求将会话归入 Codex 桌面项目，可传 `ensure_codex_project=true`，并核对项目和会话挂接状态。
+- 通过 `bridge_codex_session_model` 查询或设置目标无头 Codex 会话下一轮的模型。派发后查看本轮请求和宿主提供的模型证据，运行中的轮次继续使用其原选型。
 
 ### 路径 D：接收与批复 Codex 侧反向 MCP 提交（零 `computer-use` 全双工总线）
 - Codex 侧已注册反向 MCP 服务 `antigravity_bridge`，可通过 `agy_submit_for_review` 向本地共享总线投递待审代码或请示。
 - 调用 `bridge_check_codex_inbox` 获取待审摘要，可传 `workspace_path` 按工程筛选。审查后将该单 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。有多张待审单时必须指定编号。
+- 要求特定 Antigravity 模型的请求通过 `bridge_claim_codex_request` 领取。该工具依赖宿主检查会话 ID 和调用模型。工具报告未核验或不符时停止，不取用任务正文或回执。通过检查再处理，并按同一编号回执。
 - 用 `bridge_server.py cli wait_inbox --timeout 600 --only-new` 等待监听开始后的新提交。脚本位于 `~/.gemini/config/sidecars/chatgpt-bridge/bridge_server.py`。
 
 ---

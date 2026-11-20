@@ -185,6 +185,27 @@ class HeadlessMultiSessionMinimizedTests(unittest.TestCase):
             records.append(json.loads(p.read_text(encoding="utf-8")))
         return records
 
+    def test_same_binding_rejects_a_turn_until_the_first_finishes(self):
+        binding = self.store.create_binding(session_title="one session", workspace_path=str(self.ws_a),
+                                            transport="codex_exec")
+        first_id = "a" * 32
+        first = self.runner.dispatch(binding, first_id, "[SLEEP_SEC:0.75]", timeout_sec=0)
+        self.assertEqual(first["status"], "running_async")
+        other = HeadlessCodexRunner(self.base_dir, codex_exe=self.stub_codex)
+        second = other.dispatch(binding, "b" * 32, "Do not start now", timeout_sec=0)
+        self.assertEqual(second["error_code"], "BINDING_BUSY")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            completed = self.runner.read_latest_run(binding["binding_id"])
+            if completed.get("reply_confirmed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(completed["dispatch_id"], first_id)
+        self.assertTrue(completed["reply_confirmed"])
+        third = other.dispatch(binding, "c" * 32, "The binding is free", timeout_sec=3)
+        self.assertTrue(third["reply_confirmed"])
+        self.assertTrue(third["resumed"])
+
     def test_true_concurrent_dual_sessions(self) -> None:
         """Two bound sessions dispatched concurrently run in parallel with zero blocking and zero cross-talk."""
         bind_a = self.store.create_binding(

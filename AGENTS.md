@@ -39,3 +39,5 @@ Regardless of which AI agent invokes `install.py`, it performs the exact same no
 ## 4. Optional Antigravity conversation notifications
 
 From the workspace to connect, run `python <bridge-repo>/install.py --agy-conversation-id <conversation-id>`. This enables the Antigravity App sidecar for new Codex messages from that workspace and its subdirectories. It uses Antigravity's `agentapi send-message` to notify the selected conversation. The conversation reads the request and replies through MCP under its existing permissions. Restart Antigravity if the sidecar does not start after the configuration change. To pause notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.
+
+The optional installation also adds the bridge model verification hook to the existing Antigravity hook configuration. `--doctor` verifies the installed hook configuration. The hook checks required models on guarded requests at the time they are claimed or answered.

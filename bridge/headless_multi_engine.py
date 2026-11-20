@@ -174,6 +174,9 @@ def normalize_speed_tier(speed: str) -> str:
     return "default"
 
 
+_APPX_CODEX_EXE: Optional[Path] = None
+
+
 def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]:
     """
     Dynamically locate Windows OpenAI Codex CLI (`codex.exe`):
@@ -201,6 +204,9 @@ def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]
             if p.is_file():
                 return p.resolve()
 
+    global _APPX_CODEX_EXE
+    if _APPX_CODEX_EXE is not None and _APPX_CODEX_EXE.is_file():
+        return _APPX_CODEX_EXE
     if os.name == "nt" and shutil.which("powershell.exe"):
         ps_script = (
             '(Get-AppxPackage -Name "OpenAI.Codex" '
@@ -229,6 +235,7 @@ def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]
             if proc.returncode == 0 and install_loc:
                 appx_exe = Path(install_loc) / "app" / "resources" / "codex.exe"
                 if appx_exe.is_file():
+                    _APPX_CODEX_EXE = appx_exe
                     return appx_exe
         except Exception:
             pass
@@ -243,6 +250,7 @@ def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]
             )
             for match in matches:
                 if match.is_file():
+                    _APPX_CODEX_EXE = match
                     return match
     except OSError:
         pass
@@ -360,6 +368,7 @@ class BindingStore:
         retry_count: int = 0,
         max_retries: int = 3,
         binding_id: str = "",
+        reuse_workspace: bool = False,
         **extra: Any,
     ) -> Dict[str, Any]:
         bid = (binding_id or "").strip() or uuid.uuid4().hex
@@ -402,6 +411,18 @@ class BindingStore:
                 record[key] = val
 
         with _file_mutex(self.mutex_path):
+            if reuse_workspace and record["workspace_path"] and record["transport"] == "codex_exec":
+                matches = [
+                    binding for binding in self._list_bindings_unlocked()
+                    if binding["transport"] == "codex_exec"
+                    and _normalize_fs_path(binding.get("workspace_path", "")) == _normalize_fs_path(workspace_path)
+                    and (not codex_session_id or binding.get("codex_session_id") == codex_session_id)
+                ]
+                if len(matches) > 1:
+                    return {"ok": False, "error_code": "AMBIGUOUS_WORKSPACE_BINDINGS",
+                            "binding_ids": [binding["binding_id"] for binding in matches]}
+                if matches:
+                    return {**matches[0], "reused": True}
             _atomic_write_json(self._binding_path(bid), record)
             self._sync_legacy_lock_unlocked()
         return record
@@ -686,6 +707,7 @@ class HeadlessCodexRunner:
         last_msg_file: Path,
         read_only_dispatch_id: str = "",
         authorize_receipt: bool = False,
+        bridge_dispatch_id: str = "",
     ) -> List[str]:
         suffix = exe_path.suffix.lower()
         if suffix == ".py":
@@ -694,6 +716,8 @@ class HeadlessCodexRunner:
             prefix = [str(exe_path)]
 
         top_opts: List[str] = ["-c", 'approval_policy="never"']
+        if bridge_dispatch_id:
+            top_opts.extend(["-c", f'mcp_servers.antigravity_bridge.env.CODEX_BRIDGE_DISPATCH_ID="{bridge_dispatch_id}"'])
         sandbox = "read-only" if read_only_dispatch_id else "workspace-write"
         if read_only_dispatch_id:
             top_opts.extend([
@@ -750,6 +774,8 @@ class HeadlessCodexRunner:
         repository_read_only: bool = False,
         authorize_receipt: bool = False,
         on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+        carry_dispatch_id: bool = False,
+        retry_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         exe_path = self.discover_codex_exe()
         if exe_path is None:
@@ -767,8 +793,8 @@ class HeadlessCodexRunner:
         persisted_binding, _ = self._store.get_binding(binding_id) if binding_id != "default" else (None, None)
 
         codex_session_id = str(
-            binding.get("codex_session_id")
-            or (persisted_binding or {}).get("codex_session_id")
+            (persisted_binding or {}).get("codex_session_id")
+            or binding.get("codex_session_id")
             or ""
         ).strip()
         workspace_path = str(
@@ -777,32 +803,13 @@ class HeadlessCodexRunner:
             or ""
         ).strip()
 
-        raw_profile = binding.get("model_profile") or (persisted_binding or {}).get("model_profile") or {}
-        if not isinstance(raw_profile, dict):
-            raw_profile = {}
-        model = str(raw_profile.get("model") or binding.get("model") or "").strip()
-        effort = str(raw_profile.get("effort") or binding.get("effort") or "").strip()
-        speed = str(raw_profile.get("speed") or binding.get("speed") or "").strip()
-
         self.bindings_dir.mkdir(parents=True, exist_ok=True)
         last_run_path = self._last_run_path(binding_id)
         last_msg_file = self.bindings_dir / f".tmp_last_msg_{binding_id}_{dispatch_id}_{uuid.uuid4().hex[:6]}.txt"
 
-        cmd = self._build_command(
-            exe_path,
-            model=model,
-            effort=effort,
-            speed=speed,
-            workspace_path=workspace_path,
-            codex_session_id=codex_session_id,
-            last_msg_file=last_msg_file,
-            read_only_dispatch_id=dispatch_id if repository_read_only else "",
-            authorize_receipt=authorize_receipt,
-        )
-
-        cwd_arg: Optional[str] = None
-        if workspace_path and Path(workspace_path).is_dir():
-            cwd_arg = workspace_path
+        if workspace_path and not Path(workspace_path).is_dir():
+            return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND", "workspace_path": workspace_path}
+        cwd_arg = workspace_path or None
 
         env = {
             **os.environ,
@@ -813,7 +820,33 @@ class HeadlessCodexRunner:
         started_mono = time.monotonic()
         started_iso = _now_iso()
 
+        run_lock = _file_mutex(last_run_path.with_name(f"{binding_id}.run.mutex"), timeout_sec=0.05)
         try:
+            run_lock.__enter__()
+        except TimeoutError:
+            return {"ok": False, "error_code": "BINDING_BUSY", "binding_id": binding_id}
+        try:
+            latest = persisted_binding
+            if binding_id != "default":
+                latest, _ = self._store.get_binding(binding_id)
+                codex_session_id = str((latest or {}).get("codex_session_id") or codex_session_id).strip()
+            profile = (latest or {}).get("model_profile") or binding.get("model_profile") or {}
+            model = str(profile.get("model") or binding.get("model") or "").strip()
+            effort = str(profile.get("effort") or binding.get("effort") or "").strip()
+            speed = str(profile.get("speed") or binding.get("speed") or "").strip()
+            project_id = (latest or {}).get("codex_project_id") or binding.get("codex_project_id", "")
+            cmd = self._build_command(
+                exe_path,
+                model=model,
+                effort=effort,
+                speed=speed,
+                workspace_path=workspace_path,
+                codex_session_id=codex_session_id,
+                last_msg_file=last_msg_file,
+                read_only_dispatch_id=dispatch_id if repository_read_only else "",
+                authorize_receipt=authorize_receipt,
+                bridge_dispatch_id=dispatch_id if carry_dispatch_id else "",
+            )
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -824,6 +857,7 @@ class HeadlessCodexRunner:
                 creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except Exception as exc:
+            run_lock.__exit__(None, None, None)
             last_msg_file.unlink(missing_ok=True)
             return {
                 "ok": False,
@@ -844,6 +878,7 @@ class HeadlessCodexRunner:
             "ttft_ms": None,
             "event_count": 0,
             "usage": None,
+            "observed_model": None,
             "final_doc": None,
         }
 
@@ -855,6 +890,7 @@ class HeadlessCodexRunner:
             "channel": "codex_headless_exec",
             "binding_id": binding_id,
             "dispatch_id": dispatch_id,
+            "requested_model": model or None,
             "resumed": bool(codex_session_id),
             "codex_session_id": codex_session_id,
             "turn_id": "",
@@ -871,7 +907,17 @@ class HeadlessCodexRunner:
                 "resumed": bool(codex_session_id),
             },
         }
-        _atomic_write_json(last_run_path, initial_doc)
+        try:
+            _atomic_write_json(last_run_path, initial_doc)
+            if retry_count is not None:
+                self._store.update_binding(binding_id, retry_count=retry_count, last_dispatch_id=dispatch_id)
+        except OSError:
+            try:
+                proc.kill()
+                proc.communicate()
+            finally:
+                run_lock.__exit__(None, None, None)
+            raise
 
         stderr_Holder: List[bytes] = []
 
@@ -932,6 +978,11 @@ class HeadlessCodexRunner:
 
                         with state_lock:
                             shared["event_count"] += 1
+                            event_type = ev.get("type")
+                            if event_type == "turn.started" and isinstance(ev.get("model"), str):
+                                shared["observed_model"] = ev["model"]
+                            if event_type in ("model.rerouted", "model_rerouted") and isinstance(ev.get("to_model"), str):
+                                shared["observed_model"] = ev["to_model"]
                             if shared["ttft_ms"] is None and (
                                 msg_txt or t_id or str(ev.get("type", "")).startswith(("item.", "turn."))
                             ):
@@ -1002,6 +1053,7 @@ class HeadlessCodexRunner:
                     final_ttft = shared["ttft_ms"]
                     ev_count = shared["event_count"]
                     usage_info = shared["usage"]
+                    observed_model = shared["observed_model"]
 
                 if final_sid:
                     binding["codex_session_id"] = final_sid
@@ -1070,6 +1122,19 @@ class HeadlessCodexRunner:
                         "message": f"Codex 无头引擎执行异常 (exit_code={exit_code}): {err_detail}",
                     }
 
+                final_doc.update(requested_model=model or None, observed_model=observed_model)
+                if final_sid and project_id and final_doc["ok"]:
+                    if __package__:
+                        from .codex_projects import ProjectError, attach_thread
+                    else:
+                        from codex_projects import ProjectError, attach_thread
+                    try:
+                        attach_thread(exe_path, project_id, final_sid)
+                        final_doc["project_attachment"] = {"status": "attached", "project_id": project_id}
+                    except ProjectError as error:
+                        final_doc["project_attachment"] = {"status": "unavailable", "error_code": str(error)}
+                    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                        final_doc["project_attachment"] = {"status": "unavailable", "error_code": "CODEX_PROJECT_API_UNAVAILABLE"}
                 _atomic_write_json(last_run_path, final_doc)
                 if on_complete:
                     try:
@@ -1079,8 +1144,11 @@ class HeadlessCodexRunner:
                 with state_lock:
                     shared["final_doc"] = final_doc
             finally:
-                last_msg_file.unlink(missing_ok=True)
-                done_event.set()
+                try:
+                    last_msg_file.unlink(missing_ok=True)
+                finally:
+                    run_lock.__exit__(None, None, None)
+                    done_event.set()
 
         collector = threading.Thread(
             target=_collect_worker,
@@ -1089,7 +1157,7 @@ class HeadlessCodexRunner:
         )
         collector.start()
 
-        wait_budget = max(0.05, float(timeout_sec))
+        wait_budget = max(0.0, float(timeout_sec))
         if done_event.wait(timeout=wait_budget):
             with state_lock:
                 final_result = shared["final_doc"]
@@ -1118,6 +1186,7 @@ class HeadlessCodexRunner:
             "channel": "codex_headless_exec",
             "binding_id": binding_id,
             "dispatch_id": dispatch_id,
+            "requested_model": model or None,
             "resumed": bool(codex_session_id),
             "codex_session_id": snap_sid,
             "turn_id": snap_tid,
@@ -1156,7 +1225,11 @@ def _normalize_fs_path(raw_path: str) -> str:
     cleaned = (raw_path or "").strip().strip('"').strip("'")
     if not cleaned:
         return ""
-    return os.path.normcase(os.path.normpath(os.path.abspath(cleaned)))
+    try:
+        cleaned = str(Path(cleaned).resolve())
+    except (OSError, RuntimeError):
+        cleaned = os.path.abspath(cleaned)
+    return os.path.normcase(os.path.normpath(cleaned))
 
 
 def filter_submissions_by_workspace(

@@ -1,14 +1,14 @@
 ---
 name: codex-antigravity-bridge
 description: >-
-  Executes structured [DIRECTOR_TASK] dispatches, or when the user explicitly requests submission to Antigravity for review.
+  Exchange messages, tasks, and results between Codex and Antigravity when the user asks for cross-app collaboration.
 ---
 
-# Codex-Antigravity-Bridge — Codex 执行端
+# Codex-Antigravity-Bridge — Codex
 
 ## 1. Activation Guard (严格按需触发)
 
-- 仅当消息以 `[DIRECTOR_TASK]` 封包开头（可紧跟宿主授权指令之后），或用户明确要求向 Antigravity（反重力）提交评审时启用本技能。
+- 用户明确请求跨端协作时使用本技能。桥接的无头任务用自然语言传达，结果也用任务所用的语言回复。旧版封包和桌面模式继续使用原有约定。
 - 仓库只读派发可在封包前带一行宿主授权指令。封包标记 [RECEIPT_AUTHORIZATION: once] 时，通过当前派发专用的 agy_submit_dispatch_receipt 回传一次结果，并在最终回复中带上返回的 request_id。使用仓库只读沙箱，遵循派发范围。普通派发可通过 agy_submit_for_review 传入封包的 dispatch_id 来关联回执。
 - 普通对话按常规流程处理。
 
@@ -46,8 +46,9 @@ description: >-
 
 当需要主动向 Antigravity（反重力）发指令、提交评审或汇报结果时，**必须使用 `antigravity_bridge` MCP 工具**，严禁使用 `computer-use` 截图、移动鼠标或模拟键盘输入：
 
-- 调用 `agy_submit_for_review` 投递评审材料或请示（无需阻塞等待时设 `wait_for_reply=false` 并保留返回的 `request_id`）。
-- 调用 `agy_fetch_director_reply` 按 `request_id` 查询 Antigravity 的评审结论（`APPROVED` / `REWORK_REQUIRED` / `ESCALATE_TO_PRODUCER`）与下一步指令。
+- 把用户的自然语言意图传给 `agy_submit_for_review`，设 `wait_for_reply=false`，把返回的 `request_id` 留给工具调用。用 `agy_fetch_director_reply` 询问同一请求的投递状态与结果。
+- 用 `agy_workspace_pair(action="link")` 按已有 Antigravity 会话 ID 配对实际目录，等 `get` 确认后复用。用户要求在已配对项目中开新会话时用 `open`，并在同一工作区核对结果。缺少项目或目录验证时告诉用户具体原因。
+- 用户指定必须使用的 Antigravity 模型时，将 `required_model` 和已确认的 `target_conversation_id` 作为工具参数。路由偏好不代表实际执行。只有宿主确认后任务正文才可领取。发现模型不符时保留等待状态并汇报，用户要求取消时调用 `agy_cancel_guarded_review`。
 
 ---
 

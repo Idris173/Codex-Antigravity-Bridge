@@ -44,7 +44,7 @@ python install.py --doctor
 
 What `install.py` configures non-destructively:
 
-1. Copies the bridge runtime (`bridge_server.py`, `headless_multi_engine.py`, `notify_inbox.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll`.
+1. Copies the bridge runtime (`bridge_server.py`, `headless_multi_engine.py`, `notify_inbox.py`, `agy_model_guard.py`, `codex_projects.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll`.
 2. Installs the on-demand skills to `~/.gemini/config/skills/codex-antigravity-bridge/` and `~/.codex/skills/codex-antigravity-bridge/`.
 3. Creates timestamped `.bak` backups before non-destructively merging `chatgpt-bridge` into `~/.gemini/config/mcp_config.json` and `[mcp_servers.antigravity_bridge]` into `~/.codex/config.toml` (preserving all existing MCP servers).
 
@@ -53,6 +53,8 @@ What `install.py` configures non-destructively:
 ---
 
 ## Bidirectional Usage
+
+Ask either app in plain language, for example “Open a paired session for this folder and have Codex check the setup guide.” The bridge passes session and request identifiers through its tools. Headless Codex requests and replies use natural language by default. Desktop window mode and authorized one-time receipts for read-only tasks keep the legacy envelope.
 
 ### 1. Antigravity → Codex (Bind, Dispatch & Collect)
 
@@ -177,6 +179,19 @@ By default, inbox checks are on-demand or polled via `cli wait_inbox`. If you wa
    - Restart Antigravity if the sidecar does not start immediately after the configuration change.
    - To pause automatic notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.
 
+### Pair a workspace
+
+From Codex, use `agy_workspace_pair` with `action="link"`, the existing folder's absolute path, and the Antigravity conversation ID. Check `action="get"` until native metadata confirms that Antigravity has that folder. Multiple confirmed folders can route to their own conversations. Add the folder as an Antigravity project in the app if it has no matching project yet. To open another Antigravity chat through `action="open"`, its confirmed project must match the Sidecar's configured `projectId`.
+
+The confirmed route stays in use until the new conversation is verified. While opening, check `route.open_attempt` with `action="get"` for progress or a failure reason.
+
+From Antigravity, use `bridge_bind_session` with the same path and `reuse_workspace_binding=true` to reuse a matching Codex binding. If requested, pass `ensure_codex_project=true` to create or reuse a desktop project through the experimental Codex App Server. Check the reported desktop project status and the thread attachment after the first turn. Use `wait_for_result=false` for headless dispatches and retrieve the exact result by `dispatch_id` with `bridge_dispatch_status`.
+
+### Require a model
+
+- **Antigravity**. Pass `required_model` and the confirmed `target_conversation_id` to `agy_submit_for_review`. The Antigravity host hook checks the conversation and model when it claims the task and when it replies. Use the reply lookup to check whether the request was queued, notified, claimed, blocked, or replied to. Use `agy_cancel_guarded_review` before the request is claimed or if model verification blocks it after claim. A blocked conversation can also resume with the required model. The desktop Sidecar supports sending messages and can request a model when opening a fresh session. It provides no command to change an existing session's model. A model preference in a message does not enforce a model requirement. [Sidecars](https://antigravity.google/docs/sidecars#agentapi) · [Lifecycle hooks](https://antigravity.google/docs/hooks#pretooluse)
+- **Codex**. Use `bridge_codex_session_model` to get or set the model for the next headless turn of a binding. The tool reports the saved next model and any model evidence from the last run. The current running turn and the desktop model picker have their own selection.
+
 ---
 
 ## Uninstall & Testing
@@ -209,6 +224,8 @@ Codex-Antigravity-Bridge/
 │   ├── bridge_server.py
 │   ├── headless_multi_engine.py
 │   ├── notify_inbox.py
+│   ├── agy_model_guard.py
+│   ├── codex_projects.py
 │   ├── BridgeFastUia.cs
 │   ├── uia_driver.ps1
 │   └── uia_daemon.ps1

@@ -44,7 +44,7 @@ python install.py --doctor
 
 `install.py` 会执行以下非破坏性配置：
 
-1. 将桥接运行时（`bridge_server.py`、`headless_multi_engine.py`、`notify_inbox.py`、`BridgeFastUia.cs`、`uia_driver.ps1`、`uia_daemon.ps1`）部署至 `~/.gemini/config/sidecars/chatgpt-bridge/`，并使用本机 `.NET` 工具链预编译 `BridgeFastUia.dll`。
+1. 将桥接运行时（`bridge_server.py`、`headless_multi_engine.py`、`notify_inbox.py`、`agy_model_guard.py`、`codex_projects.py`、`BridgeFastUia.cs`、`uia_driver.ps1`、`uia_daemon.ps1`）部署至 `~/.gemini/config/sidecars/chatgpt-bridge/`，并使用本机 `.NET` 工具链预编译 `BridgeFastUia.dll`。
 2. 将双侧按需技能分别安装至 `~/.gemini/config/skills/codex-antigravity-bridge/` 与 `~/.codex/skills/codex-antigravity-bridge/`。
 3. 在修改配置前自动生成带时间戳的 `.bak` 备份，并将 `chatgpt-bridge` 与 `[mcp_servers.antigravity_bridge]` 无损合并至 `~/.gemini/config/mcp_config.json` 和 `~/.codex/config.toml`（完整保留已有的全部其他 MCP 服务）。
 
@@ -53,6 +53,8 @@ python install.py --doctor
 ---
 
 ## 双向收发用法
+
+可以直接对任一端说“在这个目录开一个配对会话，让 Codex 核对安装指南”。桥接工具负责传递会话和请求编号。无头 Codex 默认用自然语言收发。桌面窗口模式和授权回传一次结果的只读派发沿用旧封包。
 
 ### 1. Antigravity → Codex（会话绑定、任务派发与结果回收）
 
@@ -176,6 +178,19 @@ python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli reply
    - 若修改配置后 Sidecar 未立即启动，请重启一次 Antigravity。
    - 如需暂停自动通知，将 `~/.gemini/config/config.json` 中的 `sidecars.chatgpt-bridge.enabled` 设为 `false` 即可。
 
+### 配对工作区
+
+在 Codex 中调用 `agy_workspace_pair`，传入 `action="link"`、已有目录的绝对路径和 Antigravity 会话 ID。用 `action="get"` 查看原生元数据是否已确认目录。多个已确认的目录可以分别绑定不同会话。首次缺少项目时，在 Antigravity 中添加对应文件夹。使用 `action="open"` 另开 Antigravity 会话时，已确认的项目需要与 Sidecar 配置的 `projectId` 一致。
+
+原配对会继续接收请求，直到新会话通过核验。创建期间可通过 `action="get"` 的 `route.open_attempt` 查看进度或失败原因。
+
+在 Antigravity 中调用 `bridge_bind_session`，传入同一目录和 `reuse_workspace_binding=true`，即可复用对应的 Codex 绑定。需要桌面项目时可传 `ensure_codex_project=true`，由实验版 Codex App Server 创建或复用，并在首轮结束后核对会话挂接状态。无头任务可用 `wait_for_result=false` 立即取得派发编号，再用 `bridge_dispatch_status` 读取该任务的结果。
+
+### 指定模型
+
+- **Antigravity** 的请求可以通过 `agy_submit_for_review` 提交 `required_model` 和已确认的 `target_conversation_id`。领取和回执时由宿主钩子核验会话与模型。可按请求编号查看入队、通知、领取、阻塞及回执状态。尚未领取或领取后因模型校验阻塞的请求可以用 `agy_cancel_guarded_review` 取消。阻塞的会话也可用指定模型恢复处理。现有桌面 Sidecar 可以发消息，也支持在新建会话时提交模型偏好。既有会话的切换没有原生命令。正文里的模型偏好不会触发核验。[Sidecar 接口](https://antigravity.google/docs/sidecars#agentapi) · [生命周期钩子](https://antigravity.google/docs/hooks#pretooluse)
+- **Codex** 的下一轮无头模型可以通过 `bridge_codex_session_model` 查询或设置。结果同时提供已保存的下一轮模型和上一轮可用的宿主证据。已在运行的轮次和桌面选择器使用各自的模型配置。
+
 ---
 
 ## 卸载与隔离测试
@@ -208,6 +223,8 @@ Codex-Antigravity-Bridge/
 │   ├── bridge_server.py
 │   ├── headless_multi_engine.py
 │   ├── notify_inbox.py
+│   ├── agy_model_guard.py
+│   ├── codex_projects.py
 │   ├── BridgeFastUia.cs
 │   ├── uia_driver.ps1
 │   └── uia_daemon.ps1

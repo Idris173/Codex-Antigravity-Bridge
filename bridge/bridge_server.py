@@ -41,6 +41,7 @@ from headless_multi_engine import (  # noqa: E402
     filter_submissions_by_workspace,
     ui_inject_lock,
 )
+from codex_projects import ProjectError, ensure_project  # noqa: E402
 
 PS_DRIVER = BASE_DIR / "uia_driver.ps1"
 PS_DAEMON = BASE_DIR / "uia_daemon.ps1"
@@ -50,6 +51,8 @@ TO_AGY_FILE = BUS_DIR / "to_antigravity.json"
 LATEST_TO_CODEX_FILE = BUS_DIR / "to_codex_latest.json"
 REQUEST_ID = re.compile(r"req_[0-9]+_[0-9a-f]{6,32}")
 DISPATCH_ID = re.compile(r"[0-9a-f]{32}")
+CONVERSATION_ID = re.compile(r"[0-9a-zA-Z-]{32,128}")
+MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,95}")
 
 _WARM_PS_PROC: Optional[subprocess.Popen] = None
 _WARM_PS_LOCK = threading.Lock()
@@ -416,7 +419,7 @@ def parse_worker_reply(raw_text: str) -> Dict[str, Any]:
 
     return {
         "structured_protocol_matched": structured_detected,
-        "summary": sections["summary"],
+        "summary": sections["summary"] if positions else raw_text.strip(),
         "files_section": sections["files_raw"],
         "self_check": sections["self_check"],
         "open_questions": oq,
@@ -696,7 +699,7 @@ def _resolve_worker_model_profile(
 
 def tool_bind_session(
     session_title: str = "",
-    engine: str = "unreal",
+    engine: str = "general",
     mode: str = "semi_auto",
     auto_apply_files: bool = False,
     max_retries: int = 3,
@@ -709,6 +712,8 @@ def tool_bind_session(
     codex_model: str = "",
     codex_effort: str = "",
     codex_speed: str = "",
+    reuse_workspace_binding: bool = False,
+    ensure_codex_project: bool = False,
 ) -> Dict[str, Any]:
     proj = (create_in_project or "").strip()
     sw_sess = (switch_to_session or "").strip()
@@ -723,6 +728,8 @@ def tool_bind_session(
         transport_norm in ("codex_exec", "headless", "exec")
         or (transport_norm == "auto" and ws_clean and not (proj or sw_sess or title or hwnd))
     )
+    if ensure_codex_project and (not use_headless_direct or not ws_clean):
+        return {"ok": False, "error_code": "CODEX_PROJECT_REQUIRES_HEADLESS_WORKSPACE"}
     if use_headless_direct:
         if not ws_clean and not codex_session_id:
             return {
@@ -730,6 +737,22 @@ def tool_bind_session(
                 "error_code": "EMPTY_WORKSPACE_FOR_HEADLESS",
                 "message": "无头并发模式 (codex_exec) 需要提供 workspace_path 或 codex_session_id。",
             }
+        if ws_clean:
+            resolved = _existing_workspace(ws_clean)
+            if resolved is None:
+                return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND", "workspace_path": ws_clean}
+            ws_clean = resolved
+        project = {}
+        if ensure_codex_project:
+            try:
+                executable = discover_codex_exe()
+                if executable is None:
+                    raise ProjectError("CODEX_EXE_NOT_FOUND")
+                project = {"status": "confirmed", **ensure_project(executable, ws_clean)}
+            except ProjectError as error:
+                project = {"status": "unavailable", "error_code": str(error)}
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                project = {"status": "unavailable", "error_code": "CODEX_PROJECT_API_UNAVAILABLE"}
         headless_title = title or (Path(ws_clean).name if ws_clean else "Headless Codex Session")
         lock_data = store.create_binding(
             session_title=headless_title,
@@ -748,11 +771,20 @@ def tool_bind_session(
             mode=mode,
             auto_apply_files=auto_apply_files,
             max_retries=max_retries,
+            reuse_workspace=reuse_workspace_binding,
+            codex_project_id=project.get("project_id", ""),
         )
+        if not lock_data.get("binding_id"):
+            return lock_data
+        if lock_data.get("reused") and project.get("project_id"):
+            store.update_binding(lock_data["binding_id"], codex_project_id=project["project_id"])
+            lock_data = {**lock_data, "codex_project_id": project["project_id"]}
         return {
             "ok": True,
             "binding_id": lock_data["binding_id"],
             "transport": "codex_exec",
+            "reused": bool(lock_data.get("reused")),
+            "project": project,
             "message": f"已建立无头并发会话绑定: '{lock_data['session_title']}' (双端最小化与多会话并发就绪)",
             "lock": lock_data,
         }
@@ -871,6 +903,35 @@ def _is_headless_binding(lock: Dict[str, Any]) -> bool:
     )
 
 
+def tool_codex_session_model(binding_id: str, action: str = "get", model: str = "") -> Dict[str, Any]:
+    store = _binding_store()
+    binding, error = store.get_binding(binding_id)
+    if error or not binding:
+        return error or {"ok": False, "error_code": "SESSION_NOT_BOUND"}
+    if not _is_headless_binding(binding):
+        return {"ok": False, "error_code": "CODEX_DESKTOP_MODEL_NOT_SUPPORTED"}
+    if action == "set":
+        available = {entry["slug"]: entry for entry in _codex_catalog(Path.home() / ".codex")}
+        profile = available.get(model)
+        if profile is None:
+            return {"ok": False, "error_code": "CODEX_MODEL_UNAVAILABLE", "requested_model": model}
+        current = binding.get("model_profile") or {}
+        updated_profile = {"model": model}
+        if profile.get("efforts") and current.get("effort") not in profile["efforts"]:
+            updated_profile["effort"] = ""
+        speeds = {tier["id"] for tier in profile.get("speed_tiers", [])}
+        if speeds and current.get("speed") not in speeds:
+            updated_profile["speed"] = ""
+        binding = store.update_binding(binding_id, model_profile=updated_profile)
+        if not binding:
+            return {"ok": False, "error_code": "SESSION_NOT_BOUND"}
+    last_run = _headless_runner().read_latest_run(binding_id) or {}
+    return {"ok": True, "binding_id": binding_id, "codex_session_id": binding.get("codex_session_id"),
+            "next_model": (binding.get("model_profile") or {}).get("model") or None,
+            "last_dispatched_model": last_run.get("requested_model"),
+            "last_observed_model": last_run.get("observed_model"), "applies_to": "next_headless_turn"}
+
+
 def tool_dispatch_task(
     step_goal: str,
     task_instruction: str,
@@ -882,6 +943,8 @@ def tool_dispatch_task(
     routing_tag: str = "",
     repository_read_only: bool = False,
     authorize_receipt: bool = False,
+    reply_format: str = "auto",
+    wait_for_result: bool = True,
 ) -> Dict[str, Any]:
     store = _binding_store()
     lock, err = store.get_binding(binding_id)
@@ -889,6 +952,10 @@ def tool_dispatch_task(
         return err or {"ok": False, "error_code": "SESSION_NOT_BOUND", "message": "未绑定任何会话。"}
 
     use_headless = _is_headless_binding(lock)
+    if not use_headless and (reply_format == "natural" or not wait_for_result):
+        return {"ok": False, "error_code": "REQUIRES_HEADLESS_BINDING"}
+    if reply_format == "natural" and authorize_receipt:
+        return {"ok": False, "error_code": "SCOPED_RECEIPT_REQUIRES_LEGACY"}
     if authorize_receipt and not repository_read_only:
         return {"ok": False, "error_code": "RECEIPT_REQUIRES_READ_ONLY"}
     if repository_read_only and (not use_headless or not lock.get("workspace_path")):
@@ -921,25 +988,31 @@ def tool_dispatch_task(
         "repository_read_only": repository_read_only,
         "receipt_authorized": authorize_receipt,
     })
-    updated = store.update_binding(str(lock["binding_id"]), retry_count=retry_val, last_dispatch_id=dispatch_id)
-    if isinstance(updated, dict):
-        lock = updated
+    if not use_headless:
+        lock = store.update_binding(str(lock["binding_id"]), retry_count=retry_val, last_dispatch_id=dispatch_id) or lock
 
+    natural = use_headless and reply_format != "legacy" and not authorize_receipt
     envelope = build_director_envelope(
         engine=lock.get("engine", "UNREAL"),
         step_goal=step_goal,
         task_instruction=task_instruction,
         constraints=constraints,
         local_context=local_context,
-        rework_round=int(lock.get("retry_count", 0)),
+        rework_round=retry_val,
         dispatch_id=dispatch_id,
         routing_tag=routing_tag,
         repository_read_only=repository_read_only,
         authorize_receipt=authorize_receipt,
     )
+    if natural:
+        envelope = "\n\n".join(part.strip() for part in (
+            step_goal, task_instruction, constraints, local_context,
+            "请用与任务相同的语言回复，说明结果、已完成的检查和任何卡点。" if detect_language(step_goal, task_instruction, constraints) == "zh-CN"
+            else "Reply in the language of the request. Explain the outcome, checks, and any blockers.",
+        ) if part.strip())
 
     # Cap synchronous MCP wait at 55s by default so host ~70s MCP call timeout never cancels long turns
-    safe_sync_timeout = max(5, min(int(timeout_sec), 55))
+    safe_sync_timeout = max(5, min(int(timeout_sec), 55)) if wait_for_result else 0
 
     if use_headless:
         driver_res = _headless_runner().dispatch(
@@ -950,6 +1023,8 @@ def tool_dispatch_task(
             repository_read_only=repository_read_only,
             authorize_receipt=authorize_receipt,
             on_complete=lambda result: _record_execution(dispatch_id, result),
+            carry_dispatch_id=natural,
+            retry_count=retry_val,
         )
         if driver_res.get("codex_session_id"):
             lock["codex_session_id"] = driver_res["codex_session_id"]
@@ -986,7 +1061,8 @@ def tool_dispatch_task(
 
     return {
         "ok": bool(driver_res.get("ok")) or timed_out,
-        "timed_out": timed_out,
+        "timed_out": timed_out and wait_for_result,
+        "status": driver_res.get("status") or ("awaiting_completion" if timed_out else "completed"),
         "reply_confirmed": not timed_out,
         "binding_id": lock["binding_id"],
         "codex_session_id": driver_res.get("codex_session_id", lock.get("codex_session_id", "")),
@@ -995,11 +1071,13 @@ def tool_dispatch_task(
         "turn_id": driver_res.get("turn_id", ""),
         "channel": driver_res.get("channel", "uia"),
         "telemetry": telemetry,
+        "requested_model": driver_res.get("requested_model"),
+        "observed_model": driver_res.get("observed_model"),
         "message": driver_res.get("message", ""),
         "session_title": lock["session_title"],
         "mode": lock["mode"],
         "engine": lock["engine"],
-        "rework_round": lock["retry_count"],
+        "rework_round": retry_val,
         "max_retries": lock["max_retries"],
         "parsed_reply": parsed,
         "raw_reply": raw_reply,
@@ -1091,7 +1169,8 @@ def _record_execution(dispatch_id: str, result: Dict[str, Any]) -> None:
     record = {"status": status, "observed_at": _now_iso()}
     if status in ("completed", "failed"):
         record["completed_at"] = result.get("completed_at") or record["observed_at"]
-    for field in ("codex_session_id", "turn_id", "error_code"):
+    for field in ("codex_session_id", "turn_id", "error_code", "raw_reply", "telemetry",
+                  "requested_model", "observed_model", "project_attachment"):
         if result.get(field):
             record[field] = result[field]
     _atomic_write_json(_execution_path(dispatch_id), record)
@@ -1130,6 +1209,148 @@ def _reply_path(request_id: str) -> Path:
     return BUS_DIR / f"to_codex_{request_id}.json"
 
 
+def _existing_workspace(value: str) -> Optional[str]:
+    if not value or not Path(value).is_absolute():
+        return None
+    try:
+        path = Path(value).resolve(strict=True)
+        return str(path) if path.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _workspace_routes() -> Dict[str, Any]:
+    return _read_json_safe(BUS_DIR / "workspace_routes.json") or {}
+
+
+def tool_workspace_pair(action: str, workspace_path: str, conversation_id: str = "") -> Dict[str, Any]:
+    workspace = _existing_workspace(workspace_path)
+    if workspace is None:
+        return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
+    key = os.path.normcase(workspace)
+    path = BUS_DIR / "workspace_routes.json"
+    with _mutex(path.with_suffix(".mutex")):
+        routes = _workspace_routes()
+        route = routes.get(key)
+        if action == "get":
+            return {"ok": True, "workspace_path": workspace, "route": route}
+        if action == "link":
+            if not CONVERSATION_ID.fullmatch(conversation_id):
+                return {"ok": False, "error_code": "INVALID_CONVERSATION_ID"}
+            if route and route.get("conversation_id") == conversation_id and route["status"] in ("confirmed", "verifying"):
+                return {"ok": True, "route": route}
+            route = {"workspace_path": workspace, "conversation_id": conversation_id,
+                     "status": "verifying", "since_ms": int(time.time() * 1000)}
+        elif action == "open":
+            if not route or route["status"] != "confirmed" or not route.get("project_id"):
+                return {"ok": False, "error_code": "ANTIGRAVITY_PROJECT_UNCONFIRMED"}
+            if route.get("open_attempt", {}).get("status") in ("opening", "creating"):
+                return {"ok": True, "route": route}
+            route = {**route, "open_attempt": {"status": "opening"}}
+        else:
+            return {"ok": False, "error_code": "INVALID_ACTION"}
+        routes[key] = route
+        _atomic_write_json(path, routes)
+    return {"ok": True, "route": route}
+
+
+def _delivery_path(request_id: str) -> Path:
+    return BUS_DIR / "deliveries" / f"{request_id}.json"
+
+
+def _pending_request(request_id: str) -> Optional[Dict[str, Any]]:
+    if not REQUEST_ID.fullmatch(request_id) or _reply_path(request_id).is_file():
+        return None
+    item = _read_json_safe(_request_path(request_id)) or _read_json_safe(TO_AGY_FILE)
+    if item and item.get("request_id") == request_id and item.get("status") == "pending":
+        return item
+    return None
+
+
+def _visible_request(item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not item or not item.get("required_model"):
+        return item
+    return {key: item.get(key) for key in (
+        "request_id", "dispatch_id", "status", "submitted_at", "queued_at_ms", "workspace_path",
+        "target_conversation_id", "required_model",
+    )}
+
+
+def _delivery_status(request_id: str) -> Dict[str, Any]:
+    saved = _read_json_safe(_delivery_path(request_id)) or {}
+    return {key: value for key, value in saved.items() if key not in ("claim_proof", "reply_proof")}
+
+
+def _consume_model_proof(delivery: Dict[str, Any], purpose: str, proof: str) -> bool:
+    grant = delivery.get(f"{purpose}_proof", {})
+    return bool(proof and grant.get("value") == proof and grant.get("expires_at", 0) >= time.time())
+
+
+def tool_claim_codex_request(request_id: str, model_proof: str = "") -> Dict[str, Any]:
+    if not REQUEST_ID.fullmatch(request_id):
+        return {"ok": False, "error_code": "INVALID_REQUEST_ID"}
+    with _mutex(BUS_DIR / "replies.mutex"):
+        item = _pending_request(request_id)
+        if not item:
+            return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID"}
+        state = _read_json_safe(_delivery_path(request_id)) or {}
+        if not item.get("required_model"):
+            return {"ok": True, "submission": item}
+        if state.get("claimed_at"):
+            return {"ok": False, "error_code": "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED"}
+        if not _consume_model_proof(state, "claim", model_proof):
+            return {"ok": False, "error_code": "ANTIGRAVITY_MODEL_UNVERIFIED", "request_id": request_id}
+        active_path = _active_model_path(item["target_conversation_id"])
+        if _active_guarded_request(item["target_conversation_id"]):
+            state.pop("claim_proof")
+            state["status"] = "notified" if state.get("notified_at") else "queued"
+            _atomic_write_json(_delivery_path(request_id), state)
+            return {"ok": False, "error_code": "ANTIGRAVITY_CONVERSATION_BUSY"}
+        grant = state.pop("claim_proof")
+        state.update(status="claimed", claimed_at=_now_iso(), execution_model=grant["model"])
+        _atomic_write_json(_delivery_path(request_id), state)
+        _atomic_write_json(active_path, {"request_id": request_id})
+        return {"ok": True, "submission": item, "execution_model": state["execution_model"]}
+
+
+def _active_model_path(conversation_id: str) -> Path:
+    return BUS_DIR / "deliveries" / f"active_{conversation_id}.json"
+
+
+def _active_guarded_request(conversation_id: str) -> Optional[Dict[str, Any]]:
+    active = _read_json_safe(_active_model_path(conversation_id)) or {}
+    item = _pending_request(active.get("request_id", ""))
+    if item and item.get("target_conversation_id") == conversation_id:
+        return item
+    return None
+
+
+def _clear_active_guard(item: Dict[str, Any]) -> None:
+    if not item.get("required_model"):
+        return
+    path = _active_model_path(item["target_conversation_id"])
+    if (_read_json_safe(path) or {}).get("request_id") == item["request_id"]:
+        path.unlink(missing_ok=True)
+
+
+def codex_cancel_guarded_review(request_id: str) -> Dict[str, Any]:
+    with _mutex(BUS_DIR / "replies.mutex"):
+        item = _pending_request(request_id)
+        if not item or not item.get("required_model"):
+            return {"ok": False, "error_code": "UNKNOWN_GUARDED_REQUEST"}
+        state = _read_json_safe(_delivery_path(request_id)) or {}
+        if state.get("claimed_at") and state.get("status") != "blocked":
+            return {"ok": False, "error_code": "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED"}
+        _atomic_write_json(_request_path(request_id), {**item, "status": "cancelled"})
+        if state:
+            state.pop("claim_proof", None)
+            state.pop("reply_proof", None)
+            state.update(status="cancelled", cancelled_at=_now_iso())
+            _atomic_write_json(_delivery_path(request_id), state)
+        _clear_active_guard(item)
+        return {"ok": True, "request_id": request_id, "status": "cancelled"}
+
+
 def _pending_submissions() -> List[Dict[str, Any]]:
     _ensure_bus_dir()
     pending: Dict[str, Dict[str, Any]] = {}
@@ -1145,12 +1366,14 @@ def _pending_submissions() -> List[Dict[str, Any]]:
 
 
 def tool_check_codex_inbox(request_id: str = "", workspace_path: str = "") -> Dict[str, Any]:
-    pending = filter_submissions_by_workspace(_pending_submissions(), workspace_path)
     req_id = (request_id or "").strip()
     if req_id:
-        submission = next((item for item in pending if item["request_id"] == req_id), None)
+        item = _pending_request(req_id)
+        candidates = [item] if item else []
     else:
-        submission = pending[0] if pending else None
+        candidates = _pending_submissions()
+    pending = [_visible_request(item) for item in filter_submissions_by_workspace(candidates, workspace_path)]
+    submission = pending[0] if pending else None
     return {
         "ok": True,
         "has_pending": bool(pending),
@@ -1159,7 +1382,8 @@ def tool_check_codex_inbox(request_id: str = "", workspace_path: str = "") -> Di
         "oldest_pending": pending[0] if pending else None,
         "latest_pending": pending[-1] if pending else None,
         "pending_summaries": [
-            {key: item.get(key, "") for key in ("request_id", "dispatch_id", "submitted_at", "workspace_path", "step_summary")}
+            {key: item.get(key, "") for key in ("request_id", "dispatch_id", "submitted_at", "queued_at_ms",
+                                               "workspace_path", "step_summary", "required_model", "target_conversation_id")}
             for item in pending
         ],
         "pending_request_ids": [item["request_id"] for item in pending],
@@ -1171,15 +1395,16 @@ def tool_reply_to_codex(
     decision: str = "APPROVED",
     review_feedback: str = "",
     next_instruction: str = "",
+    model_proof: str = "",
 ) -> Dict[str, Any]:
     if decision not in ("APPROVED", "REWORK_REQUIRED", "ESCALATE_TO_PRODUCER"):
         return {"ok": False, "error_code": "INVALID_DECISION", "message": f"非法评审结论: {decision}"}
 
     _ensure_bus_dir()
     with _mutex(BUS_DIR / "replies.mutex"):
-        pending = _pending_submissions()
         req_id = (request_id or "").strip()
         if not req_id:
+            pending = _pending_submissions()
             if not pending:
                 return {"ok": False, "error_code": "NO_PENDING_REQUESTS", "message": "当前没有待评审单。"}
             if len(pending) > 1:
@@ -1204,8 +1429,14 @@ def tool_reply_to_codex(
                 return {"ok": True, "already_replied": True, "reply": existing}
             return {"ok": False, "error_code": "ALREADY_REPLIED", "request_id": req_id}
 
-        if not any(item["request_id"] == req_id for item in pending):
+        request = _pending_request(req_id)
+        if request is None:
             return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID", "request_id": req_id}
+
+        state = _read_json_safe(_delivery_path(req_id)) or {}
+        if request.get("required_model"):
+            if not state.get("claimed_at") or not _consume_model_proof(state, "reply", model_proof):
+                return {"ok": False, "error_code": "ANTIGRAVITY_MODEL_UNVERIFIED", "request_id": req_id}
 
         reply_payload = {
             "ok": True,
@@ -1213,11 +1444,19 @@ def tool_reply_to_codex(
             "replied_at": _now_iso(),
             **fields,
         }
-        request = next(item for item in pending if item["request_id"] == req_id)
         if request.get("dispatch_id"):
             reply_payload["dispatch_id"] = request["dispatch_id"]
+        if request.get("required_model"):
+            reply_payload["execution_model"] = state["execution_model"]
+            reply_payload["reply_model"] = state["reply_proof"]["model"]
+            reply_payload["target_conversation_id"] = request["target_conversation_id"]
+            reply_payload["required_model"] = request["required_model"]
         _atomic_write_json(path, reply_payload)
         _atomic_write_json(LATEST_TO_CODEX_FILE, reply_payload)
+        if state:
+            state.pop("reply_proof", None)
+            state.update(status="replied", replied_at=reply_payload["replied_at"])
+            _atomic_write_json(_delivery_path(req_id), state)
 
         req_file = _request_path(req_id)
         req_doc = _read_json_safe(req_file)
@@ -1225,6 +1464,7 @@ def tool_reply_to_codex(
             req_doc["status"] = "replied"
             req_doc["replied_at"] = reply_payload["replied_at"]
             _atomic_write_json(req_file, req_doc)
+        _clear_active_guard(request)
 
     return {
         "ok": True,
@@ -1242,6 +1482,7 @@ def _queue_dispatch_receipt(dispatch: Dict[str, Any], submission: Dict[str, Any]
     path = _request_path(request_id)
     submission = {
         **submission,
+        "queued_at_ms": int(time.time() * 1000),
         "request_id": request_id,
         "dispatch_id": dispatch["dispatch_id"],
         "workspace_path": dispatch["workspace_path"] or submission["workspace_path"],
@@ -1291,6 +1532,8 @@ def codex_tool_submit_for_review(
     wait_for_reply: bool = True,
     wait_timeout_sec: int = 240,
     dispatch_id: str = "",
+    required_model: str = "",
+    target_conversation_id: str = "",
 ) -> Dict[str, Any]:
     dispatch = _load_dispatch(dispatch_id) if dispatch_id else None
     if dispatch_id and not dispatch:
@@ -1302,11 +1545,23 @@ def codex_tool_submit_for_review(
     ):
         return {"ok": False, "error_code": "DISPATCH_WORKSPACE_MISMATCH", "dispatch_id": dispatch_id}
 
+    if required_model or target_conversation_id:
+        if dispatch:
+            return {"ok": False, "error_code": "MODEL_REQUIREMENT_NOT_SUPPORTED_FOR_DISPATCH_RECEIPTS"}
+        if not MODEL_ID.fullmatch(required_model):
+            return {"ok": False, "error_code": "INVALID_ANTIGRAVITY_MODEL"}
+        workspace = _existing_workspace(workspace_path)
+        route = _workspace_routes().get(os.path.normcase(workspace)) if workspace else None
+        if not route or route["status"] != "confirmed" or route["conversation_id"] != target_conversation_id:
+            return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNCONFIRMED"}
+        workspace_path = workspace
+
     req_id = dispatch["request_id"] if dispatch else f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
     submission = {
         "request_id": req_id,
         "status": "pending",
         "submitted_at": _now_iso(),
+        "queued_at_ms": int(time.time() * 1000),
         "workspace_path": workspace_path or os.getcwd(),
         "step_summary": step_summary,
         "changed_files": changed_files,
@@ -1314,6 +1569,8 @@ def codex_tool_submit_for_review(
         "self_check": self_check,
         "open_questions": open_questions,
     }
+    if required_model:
+        submission.update(required_model=required_model, target_conversation_id=target_conversation_id)
     if dispatch:
         queued = _queue_dispatch_receipt(dispatch, submission)
         if not queued["ok"]:
@@ -1327,8 +1584,9 @@ def codex_tool_submit_for_review(
             "message": "已投递至 Antigravity 技术总监收件箱（非阻塞模式）。稍后可调用 agy_fetch_director_reply 获取评审结论。",
         }
 
-    if not wait_for_reply:
-        return queued
+    if not wait_for_reply or required_model:
+        return {**queued, **({"required_model": required_model, "target_conversation_id": target_conversation_id}
+                            if required_model else {})}
 
     reply_file = _reply_path(req_id)
     deadline = time.monotonic() + max(5, min(int(wait_timeout_sec), 290))
@@ -1359,8 +1617,21 @@ def codex_tool_fetch_director_reply(request_id: str = "") -> Dict[str, Any]:
             return {"ok": False, "error_code": "INVALID_REQUEST_ID", "message": "request_id 格式无效。"}
         rep = _read_json_safe(_reply_path(req_id))
         if isinstance(rep, dict) and rep.get("request_id") == req_id:
+            if rep.get("required_model"):
+                return {**rep, "status": "replied", "delivery": _delivery_status(req_id)}
             return rep
-        return {"ok": True, "request_id": req_id, "status": "pending", "message": f"请求 {req_id} 仍在等待批复。"}
+        item = _pending_request(req_id)
+        if item is None:
+            record = _read_json_safe(_request_path(req_id))
+            if record and record.get("status") == "cancelled":
+                return {"ok": True, "request_id": req_id, "status": "cancelled"}
+            return {"ok": False, "request_id": req_id, "error_code": "UNKNOWN_REQUEST_ID"}
+        delivery = _delivery_status(req_id)
+        if item.get("required_model"):
+            delivery = {"status": "queued", "required_model": item["required_model"],
+                        "target_conversation_id": item["target_conversation_id"], **delivery}
+        return {"ok": True, "request_id": req_id, "status": "pending", "delivery": delivery,
+                "message": f"请求 {req_id} 仍在等待批复。"}
     latest = _read_json_safe(LATEST_TO_CODEX_FILE)
     if latest:
         return latest
@@ -1407,6 +1678,23 @@ def _routing_tool(name: str) -> dict:
 AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     _routing_tool("bridge_routing_settings"),
     {
+        "name": "bridge_codex_session_model",
+        "description": "读取或为指定无头 Codex 会话设置下一轮模型。运行中的轮次继续使用自己的模型。",
+        "inputSchema": {"type": "object", "properties": {
+            "binding_id": {"type": "string"},
+            "action": {"type": "string", "enum": ["get", "set"]},
+            "model": {"type": "string"},
+        }, "required": ["binding_id"], "additionalProperties": False},
+    },
+    {
+        "name": "bridge_claim_codex_request",
+        "description": "按编号领取入箱任务。指定模型的任务只有在目标会话的宿主钩子确认模型后才返回正文。",
+        "inputSchema": {"type": "object", "properties": {
+            "request_id": {"type": "string"},
+            "model_proof": {"type": "string", "description": "由 Antigravity Hook 填充。"},
+        }, "required": ["request_id"], "additionalProperties": False},
+    },
+    {
         "name": "bridge_inspect_app",
         "description": (
             "门禁检测工具：检查本机 ChatGPT 桌面应用是否已开启，读取当前激活会话标题、"
@@ -1437,8 +1725,9 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "auto_apply_files": {"type": "boolean"},
                 "max_retries": {"type": "integer"},
                 "hwnd": {"type": "integer"},
+                "reuse_workspace_binding": {"type": "boolean"},
+                "ensure_codex_project": {"type": "boolean", "description": "显式允许用实验版 App Server 创建或复用桌面项目。"},
             },
-            "required": ["engine", "mode"],
         },
     },
     {
@@ -1455,6 +1744,8 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "binding_id": {"type": "string"},
                 "is_rework": {"type": "boolean"},
                 "timeout_sec": {"type": "integer"},
+                "reply_format": {"type": "string", "enum": ["auto", "legacy", "natural"]},
+                "wait_for_result": {"type": "boolean"},
                 "repository_read_only": {"type": "boolean", "description": "无头 Codex 使用 read-only 沙箱。"},
                 "authorize_receipt": {"type": "boolean", "description": "为这个只读任务授权写入一条 MCP 回执。"},
             },
@@ -1521,6 +1812,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 },
                 "review_feedback": {"type": "string", "description": "具体的代码或几何/架构审查意见。"},
                 "next_instruction": {"type": "string", "description": "指示 Codex 立即执行的下一步指令。"},
+                "model_proof": {"type": "string", "description": "由 Antigravity Hook 填充。"},
             },
             "required": ["decision", "review_feedback"],
         },
@@ -1529,6 +1821,21 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
 
 CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
     _routing_tool("agy_routing_settings"),
+    {
+        "name": "agy_workspace_pair",
+        "description": "按真实路径查询或登记 Antigravity 会话。link 等待宿主校验，open 尝试创建新会话，确认后才切换路由。get 的 route.open_attempt 提供创建进度或失败原因。",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["get", "link", "open"]},
+            "workspace_path": {"type": "string"},
+            "conversation_id": {"type": "string"},
+        }, "required": ["action", "workspace_path"], "additionalProperties": False},
+    },
+    {
+        "name": "agy_cancel_guarded_review",
+        "description": "取消尚未领取或因模型不匹配而阻塞的指定模型请求。",
+        "inputSchema": {"type": "object", "properties": {"request_id": {"type": "string"}},
+                        "required": ["request_id"], "additionalProperties": False},
+    },
     {
         "name": "agy_submit_for_review",
         "description": (
@@ -1556,6 +1863,8 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
                     "description": "是否阻塞等待 Antigravity 实时写回评审结论（默认 true）。",
                 },
                 "dispatch_id": {"type": "string", "description": "可选。对应普通派发的 DISPATCH_ID。"},
+                "required_model": {"type": "string", "description": "必须执行本请求的 Antigravity 模型，由宿主钩子校验。"},
+                "target_conversation_id": {"type": "string", "description": "已按工作区验证的 Antigravity 会话 ID。"},
                 "wait_timeout_sec": {
                     "type": "integer",
                     "description": "等待批复超时秒数（默认 240 秒）。",
@@ -1667,6 +1976,10 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
         return tool_routing_settings(**args)
 
     if role == "codex":
+        if name == "agy_workspace_pair":
+            return tool_workspace_pair(**args)
+        if name == "agy_cancel_guarded_review":
+            return codex_cancel_guarded_review(args["request_id"])
         if name == "agy_submit_for_review":
             return codex_tool_submit_for_review(
                 step_summary=args.get("step_summary", ""),
@@ -1677,7 +1990,9 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
                 workspace_path=args.get("workspace_path", ""),
                 wait_for_reply=bool(args.get("wait_for_reply", True)),
                 wait_timeout_sec=int(args.get("wait_timeout_sec", 240)),
-                dispatch_id=args.get("dispatch_id", ""),
+                dispatch_id=args.get("dispatch_id") or os.environ.get("CODEX_BRIDGE_DISPATCH_ID", ""),
+                required_model=args.get("required_model", ""),
+                target_conversation_id=args.get("target_conversation_id", ""),
             )
         if name == "agy_fetch_director_reply":
             return codex_tool_fetch_director_reply(request_id=args.get("request_id", ""))
@@ -1687,10 +2002,12 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
 
     if name == "bridge_inspect_app":
         return tool_inspect_app()
+    if name == "bridge_codex_session_model":
+        return tool_codex_session_model(**args)
     if name == "bridge_bind_session":
         return tool_bind_session(
             session_title=args.get("session_title", ""),
-            engine=args.get("engine", "unreal"),
+            engine=args.get("engine", "general"),
             mode=args.get("mode", "semi_auto"),
             auto_apply_files=bool(args.get("auto_apply_files", False)),
             max_retries=int(args.get("max_retries", 3)),
@@ -1703,6 +2020,8 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
             codex_model=args.get("codex_model", ""),
             codex_effort=args.get("codex_effort", ""),
             codex_speed=args.get("codex_speed", ""),
+            reuse_workspace_binding=bool(args.get("reuse_workspace_binding", False)),
+            ensure_codex_project=bool(args.get("ensure_codex_project", False)),
         )
     if name == "bridge_dispatch_task":
         return tool_dispatch_task(
@@ -1716,6 +2035,8 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
             routing_tag=args.get("routing_tag", ""),
             repository_read_only=bool(args.get("repository_read_only", False)),
             authorize_receipt=bool(args.get("authorize_receipt", False)),
+            reply_format=args.get("reply_format", "auto"),
+            wait_for_result=bool(args.get("wait_for_result", True)),
         )
     if name == "bridge_dispatch_status":
         return tool_dispatch_status(args["dispatch_id"])
@@ -1730,12 +2051,15 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
         return tool_unbind_session(binding_id=args.get("binding_id", ""))
     if name == "bridge_check_codex_inbox":
         return tool_check_codex_inbox(request_id=args.get("request_id", ""), workspace_path=args.get("workspace_path", ""))
+    if name == "bridge_claim_codex_request":
+        return tool_claim_codex_request(**args)
     if name == "bridge_reply_to_codex":
         return tool_reply_to_codex(
             request_id=args.get("request_id", ""),
             decision=args.get("decision", "APPROVED"),
             review_feedback=args.get("review_feedback", ""),
             next_instruction=args.get("next_instruction", ""),
+            model_proof=args.get("model_proof", ""),
         )
     return {"ok": False, "error_code": "UNKNOWN_TOOL", "message": f"未知工具: {name}"}
 
@@ -1904,7 +2228,7 @@ def run_cli(argv: list[str]) -> int:
             pending = _pending_submissions()
             submission = next((item for item in pending if item["request_id"] not in seen), None)
             if submission:
-                res = {"ok": True, "event": "NEW_CODEX_SUBMISSION", "submission": submission, "pending_count": len(pending)}
+                res = {"ok": True, "event": "NEW_CODEX_SUBMISSION", "submission": _visible_request(submission), "pending_count": len(pending)}
                 break
             time.sleep(0.05)
     elif args.subcmd == "reply_codex":
