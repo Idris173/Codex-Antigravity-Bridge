@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>这些话可以直接说 · Codex–Antigravity Bridge</title>
+  <meta name="description" content="可以直接说给 Codex 和 Antigravity 听的简单句子。">
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f3f6f7;
+      --paper: #ffffff;
+      --ink: #162b37;
+      --subtle: #4b626d;
+      --line: #dbe5e8;
+      --accent: #00675f;
+      --brand: #0b2632;
+      font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--canvas); color: var(--ink); line-height: 1.6; }
+    button { font: inherit; }
+    button { cursor: pointer; }
+    a { color: var(--accent); text-underline-offset: .2em; }
+    :focus-visible { outline: 3px solid #087e72; outline-offset: 4px; }
+    .wrap { width: min(990px, calc(100% - 72px)); margin-inline: auto; }
+    .hero {
+      color: #fff;
+      background: radial-gradient(ellipse at 98% 12%, #0e5355, transparent 67%), var(--brand);
+      border-bottom: 4px solid #3abb9e;
+    }
+    .hero .wrap { padding-block: 32px 45px; }
+    .hero-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+    .wordmark { display: flex; align-items: center; gap: 10px; color: #bde8df; font-size: .82rem; font-weight: 650; letter-spacing: .06em; }
+    .wordmark::before { content: ""; inline-size: 21px; block-size: 5px; border-radius: 8px; background: #6fe4c5; }
+    .languages { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid #568991; border-radius: 8px; }
+    .languages button { border: 0; border-radius: 5px; padding: 4px 9px; background: transparent; color: #d6e7ea; font-size: .8rem; font-weight: 650; }
+    .languages button[aria-pressed="true"] { background: #dff4ee; color: #00584f; }
+    h1 { margin: 15px 0 7px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.18; letter-spacing: -.025em; }
+    .hero p { color: #d6e7ea; margin: 0; font-size: 1rem; }
+    main.wrap { padding-block: 31px 44px; }
+    .views { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 4px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+    .views button { border: 0; border-radius: 6px; padding: 6px 11px; color: var(--subtle); background: transparent; font-size: .86rem; font-weight: 650; }
+    .views button:hover { color: var(--accent); }
+    .views button[aria-pressed="true"] { color: #00584f; background: #dff4ee; }
+    .group { scroll-margin-top: 22px; margin-bottom: 32px; }
+    .group:last-of-type { margin-bottom: 0; }
+    .group h2 { margin: 0 0 11px; font-size: 1.27rem; line-height: 1.28; }
+    .group-intro { margin: -2px 0 13px; color: var(--subtle); font-size: .93rem; }
+    .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      min-width: 0;
+      padding: 15px;
+    }
+    .card-head { display: flex; align-items: flex-start; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; }
+    h3 { margin: 0; font-size: .99rem; line-height: 1.4; }
+    .recipient { padding: 1px 7px; border-radius: 4px; font-size: .72rem; font-weight: 650; background: #e9f0f7; color: #2a4a63; white-space: nowrap; }
+    [data-audience="antigravity"] .recipient { background: #e0f3eb; color: #035e50; }
+    [data-audience="both"] .recipient { background: #eeeaf7; color: #574185; }
+    .steps { margin: 0; padding-inline-start: 1.2em; font-size: .88rem; }
+    .steps li + li { margin-top: 4px; }
+    .card-links { display: flex; flex-wrap: wrap; gap: 3px 13px; font-size: .81rem; }
+    .prompt-text {
+      background: #f6f8f9;
+      border-left: 2px solid #86b4b0;
+      border-radius: 4px 7px 7px 4px;
+      color: var(--ink);
+      font-size: 1rem;
+      line-height: 1.7;
+      margin: 0;
+      padding: 10px 11px;
+      overflow-wrap: anywhere;
+    }
+    .variable { color: #005c53; font-weight: 650; }
+    .card-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; }
+    .copy { flex: none; margin-inline-start: auto; color: var(--accent); border: 1px solid #a9cac4; border-radius: 6px; background: #f4fcfa; padding: 6px 12px; font-size: .85rem; font-weight: 650; }
+    .copy:hover { background: #dff4ee; }
+    .copy:active { background: #ccece4; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+    footer { border-top: 1px solid var(--line); color: var(--subtle); font-size: .8rem; }
+    footer .wrap { display: flex; flex-wrap: wrap; gap: 6px 18px; justify-content: space-between; padding-block: 16px; }
+    @media (max-width: 850px) {
+      .wrap { width: calc(100% - 44px); }
+      main.wrap { padding-top: 24px; }
+    }
+    @media (max-width: 650px) {
+      .wrap { width: calc(100% - 30px); }
+      .hero .wrap { padding-block: 24px 29px; }
+      .cards { grid-template-columns: 1fr; }
+    }
+    @media print {
+      body, .hero { background: #fff; color: #162b37; }
+      .hero p, .wordmark { color: #162b37; }
+      .wrap { width: 100%; }
+      .languages, .views, .copy { display: none; }
+      .card { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <div class="hero-top">
+        <div class="wordmark">Codex × Antigravity</div>
+        <div class="languages" role="group" aria-label="语言">
+          <button type="button" data-language="zh-CN" lang="zh-CN" aria-pressed="true">简体中文</button>
+          <button type="button" data-language="en" lang="en" aria-pressed="false">English</button>
+        </div>
+      </div>
+      <h1 id="page-heading">这些话可以直接说</h1>
+      <p id="page-tip">点「复制」，发给卡片上写的那一边。方括号里的字换成你自己的。</p>
+    </div>
+  </header>
+  <main class="wrap">
+    <div class="views" role="group" aria-label="选择视角">
+      <button type="button" data-view="all" aria-pressed="true">全部</button>
+      <button type="button" data-view="codex" aria-pressed="false">Codex 视角</button>
+      <button type="button" data-view="antigravity" aria-pressed="false">反重力视角</button>
+    </div>
+    <div lang="zh-CN" data-language-pane="zh-CN">
+<section class="group" id="setup" aria-labelledby="setup-title">
+  <h2 id="setup-title">Windows 安装和更新</h2>
+
+  <div class="cards">
+<article class="card" data-audience="both" aria-labelledby="setup-1-title">
+  <div class="card-head">
+    <h3 id="setup-1-title">帮我装好</h3>
+    <span class="recipient">两边都行</span>
+  </div>
+
+  <p class="prompt-text" id="setup-1-prompt">请在 Windows 上从 <a href="https://github.com/Idris173/Codex-Antigravity-Bridge">https://github.com/Idris173/Codex-Antigravity-Bridge.git</a> 下载并安装桥接套件。装好后，帮我检查两边能不能用。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="setup-1-prompt" aria-label="复制 帮我装好">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="setup-2-title">
+  <div class="card-head">
+    <h3 id="setup-2-title">帮我更新</h3>
+    <span class="recipient">两边都行</span>
+  </div>
+
+  <p class="prompt-text" id="setup-2-prompt">请在 Windows 上更新两边的桥接技能。请到 <a href="https://github.com/Idris173/Codex-Antigravity-Bridge">https://github.com/Idris173/Codex-Antigravity-Bridge.git</a> 找最新版。更新好后，检查两边还能不能用。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="setup-2-prompt" aria-label="复制 帮我更新">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="setup-3-title">
+  <div class="card-head">
+    <h3 id="setup-3-title">有消息就提醒</h3>
+    <span class="recipient">两边都行</span>
+  </div>
+
+  <p class="prompt-text" id="setup-3-prompt">请让 Antigravity 自动收到这个文件夹的新消息。也帮我打开检查模型的功能。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="setup-3-prompt" aria-label="复制 有消息就提醒">复制</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="mac" aria-labelledby="mac-title">
+  <h2 id="mac-title">Mac 同事怎么用</h2>
+  <p class="group-intro">Mac 可以试用无头预览，也可以远程使用 Windows 上的桥接。Mac 实机上的自动收发仍待验证。</p>
+  <div class="cards">
+<article class="card" data-audience="antigravity" aria-labelledby="mac-1-title">
+  <div class="card-head">
+    <h3 id="mac-1-title">有 Windows 电脑可以连</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+  <ol class="steps"><li>请团队给你远程连接权限。在 Mac 上用团队的远程桌面连到 Windows 电脑。</li><li>进到 Windows 后，用同一个 Windows 账号打开 Codex 和 Antigravity。两边都打开那台 Windows 电脑上的同一个项目文件夹。</li><li>Windows 上需要 Git 和 Python 3.11 或更新版本。</li></ol><div class="card-links"><a href="https://learn.microsoft.com/en-us/windows-app/get-started-connect-devices-desktops-apps">微软远程连接说明</a></div>
+  <p class="prompt-text" id="mac-1-prompt">请从 <a href="https://github.com/Idris173/Codex-Antigravity-Bridge">https://github.com/Idris173/Codex-Antigravity-Bridge.git</a> 安装桥接。装好后帮我检查。再让 Codex 在后台只看项目说明。我允许它回一条消息。你收到后告诉我。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="mac-1-prompt" aria-label="复制 有 Windows 电脑可以连">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="mac-2-title">
+  <div class="card-head">
+    <h3 id="mac-2-title">在 Mac 上试用预览版</h3>
+    <span class="recipient">两边都行</span>
+  </div>
+  <ol class="steps"><li>先在 Mac 上装好 Python 3.11 或更新版本。</li><li>装好 Codex CLI 和 Antigravity，并分别登录。</li></ol><div class="card-links"><a href="https://github.com/Idris173/Codex-Antigravity-Bridge/tree/macos-headless">打开 Mac 预览分支</a></div>
+  <p class="prompt-text" id="mac-2-prompt">请从 <a href="https://github.com/Idris173/Codex-Antigravity-Bridge">https://github.com/Idris173/Codex-Antigravity-Bridge.git</a> 下载 macos-headless 分支。在这台 Mac 上按说明装好桥接，检查两边能不能用。然后试发一条只读消息，看看对方会不会回。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="mac-2-prompt" aria-label="复制 在 Mac 上试用预览版">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="mac-3-title">
+  <div class="card-head">
+    <h3 id="mac-3-title">在 Mac 上手动交接</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+  <ol class="steps"><li>在 Mac 上装好 ChatGPT 和 Antigravity。在 ChatGPT 里打开 Codex。</li><li>两边打开同一个项目。先把 Antigravity 的建议复制给 Codex。Codex 做完了，再把结果复制回去。</li><li>一次只让一个工具改文件，另一个只看和给建议。</li></ol><div class="card-links"><a href="https://chatgpt.com/download/">下载 ChatGPT</a> <a href="https://antigravity.google/download">下载 Antigravity</a></div>
+  <p class="prompt-text" id="mac-3-prompt">这是 Antigravity 给我的建议：<span class="variable">[把建议贴在这里]</span>。请在这个项目里照着做。做完后告诉我结果。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="mac-3-prompt" aria-label="复制 在 Mac 上手动交接">复制</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="pairing" aria-labelledby="pairing-title">
+  <h2 id="pairing-title">把两边连起来</h2>
+
+  <div class="cards">
+<article class="card" data-audience="codex" aria-labelledby="pairing-1-title">
+  <div class="card-head">
+    <h3 id="pairing-1-title">连上 Antigravity 的聊天</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+
+  <p class="prompt-text" id="pairing-1-prompt">把这个文件夹和我选的 Antigravity 聊天连起来。连好后告诉我。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="pairing-1-prompt" aria-label="复制 连上 Antigravity 的聊天">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="pairing-2-title">
+  <div class="card-head">
+    <h3 id="pairing-2-title">继续上次的聊天</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="pairing-2-prompt">帮我把这个文件夹连到 Codex。要是以前已经连好了，就继续用原来的聊天。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="pairing-2-prompt" aria-label="复制 继续上次的聊天">复制</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="dispatch" aria-labelledby="dispatch-title">
+  <h2 id="dispatch-title">请它帮忙</h2>
+
+  <div class="cards">
+<article class="card" data-audience="antigravity" aria-labelledby="dispatch-1-title">
+  <div class="card-head">
+    <h3 id="dispatch-1-title">让 Codex 做一件事</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="dispatch-1-prompt">请让 Codex 帮我做这件事：<span class="variable">[要做的事]</span>。做完后告诉我。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="dispatch-1-prompt" aria-label="复制 让 Codex 做一件事">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="dispatch-2-title">
+  <div class="card-head">
+    <h3 id="dispatch-2-title">请 Codex 只看看</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="dispatch-2-prompt">请让 Codex 看看 <span class="variable">[要检查的东西]</span>。文件请保持原样。看完后，我允许它回一条消息。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="dispatch-2-prompt" aria-label="复制 请 Codex 只看看">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="dispatch-3-title">
+  <div class="card-head">
+    <h3 id="dispatch-3-title">请 Antigravity 帮我看看</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+
+  <p class="prompt-text" id="dispatch-3-prompt">请把我改过的东西发给 Antigravity，让它只检查有没有问题。它回话了，请告诉我。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="dispatch-3-prompt" aria-label="复制 请 Antigravity 帮我看看">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="dispatch-4-title">
+  <div class="card-head">
+    <h3 id="dispatch-4-title">给 Codex 回个话</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="dispatch-4-prompt">请看看 Codex 发来的消息 <span class="variable">[消息编号]</span>。帮它检查一下，再把结果回给它。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="dispatch-4-prompt" aria-label="复制 给 Codex 回个话">复制</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="models" aria-labelledby="models-title">
+  <h2 id="models-title">换模型或问进度</h2>
+
+  <div class="cards">
+<article class="card" data-audience="both" aria-labelledby="models-1-title">
+  <div class="card-head">
+    <h3 id="models-1-title">先看看能用什么模型</h3>
+    <span class="recipient">两边都行</span>
+  </div>
+
+  <p class="prompt-text" id="models-1-prompt">先告诉我两边都能用哪些模型，哪些更快。等我挑好再开始。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="models-1-prompt" aria-label="复制 先看看能用什么模型">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="models-2-title">
+  <div class="card-head">
+    <h3 id="models-2-title">让 Antigravity 换成 Neon</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+
+  <p class="prompt-text" id="models-2-prompt">请把 Antigravity 的这个聊天换成 Neon，选中等思考。换好后，让原来的聊天说一句「你好」，再确认它真的用了 Neon。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="models-2-prompt" aria-label="复制 让 Antigravity 换成 Neon">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="models-3-title">
+  <div class="card-head">
+    <h3 id="models-3-title">让 Codex 换模型</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="models-3-prompt">下次让已经连好的 Codex 聊天用 <span class="variable">[想用的模型]</span>。继续用原来的聊天。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="models-3-prompt" aria-label="复制 让 Codex 换模型">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="models-4-title">
+  <div class="card-head">
+    <h3 id="models-4-title">消息送到了吗</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+
+  <p class="prompt-text" id="models-4-prompt">我刚才发的消息送到了吗？Antigravity 回了吗？</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="models-4-prompt" aria-label="复制 消息送到了吗">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="models-5-title">
+  <div class="card-head">
+    <h3 id="models-5-title">Codex 做完了吗</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="models-5-prompt">Codex 做完刚才的事了吗？它用了哪个模型？</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="models-5-prompt" aria-label="复制 Codex 做完了吗">复制</button>
+  </div>
+</article>
+  </div>
+</section>
+</div>
+<div lang="en" data-language-pane="en" hidden>
+<section class="group" id="en-setup" aria-labelledby="en-setup-title">
+  <h2 id="en-setup-title">Install and update on Windows</h2>
+
+  <div class="cards">
+<article class="card" data-audience="both" aria-labelledby="en-setup-1-title">
+  <div class="card-head">
+    <h3 id="en-setup-1-title">Install the bridge</h3>
+    <span class="recipient">Ask either app</span>
+  </div>
+
+  <p class="prompt-text" id="en-setup-1-prompt">Please install the bridge on Windows from <a href="https://github.com/Idris173/Codex-Antigravity-Bridge.git.">https://github.com/Idris173/Codex-Antigravity-Bridge.git.</a> Then check that both apps can use it.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-setup-1-prompt" aria-label="Copy Install the bridge">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="en-setup-2-title">
+  <div class="card-head">
+    <h3 id="en-setup-2-title">Update the skills</h3>
+    <span class="recipient">Ask either app</span>
+  </div>
+
+  <p class="prompt-text" id="en-setup-2-prompt">Please update the bridge skills for both apps on Windows. Get the latest version from <a href="https://github.com/Idris173/Codex-Antigravity-Bridge.git.">https://github.com/Idris173/Codex-Antigravity-Bridge.git.</a> Then check that both apps still work.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-setup-2-prompt" aria-label="Copy Update the skills">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="en-setup-3-title">
+  <div class="card-head">
+    <h3 id="en-setup-3-title">Tell me when a message arrives</h3>
+    <span class="recipient">Ask either app</span>
+  </div>
+
+  <p class="prompt-text" id="en-setup-3-prompt">Please have Antigravity pick up new messages for this folder. Turn on the model check too.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-setup-3-prompt" aria-label="Copy Tell me when a message arrives">Copy</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="en-mac" aria-labelledby="en-mac-title">
+  <h2 id="en-mac-title">Using a Mac</h2>
+  <p class="group-intro">You can try the Mac preview or connect to a Windows computer that runs the bridge. Automatic messages still need an end-to-end test on a Mac.</p>
+  <div class="cards">
+<article class="card" data-audience="antigravity" aria-labelledby="en-mac-1-title">
+  <div class="card-head">
+    <h3 id="en-mac-1-title">Use a team Windows computer</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+  <ol class="steps"><li>Ask your team for access, then use remote desktop on your Mac to connect to Windows.</li><li>Open Codex and Antigravity under the same Windows account. Open the same folder on that Windows computer in both apps.</li><li>Install Git and Python 3.11 or later on the Windows computer.</li></ol><div class="card-links"><a href="https://learn.microsoft.com/en-us/windows-app/get-started-connect-devices-desktops-apps">Microsoft remote desktop guide</a></div>
+  <p class="prompt-text" id="en-mac-1-prompt">Please install the bridge from <a href="https://github.com/Idris173/Codex-Antigravity-Bridge">https://github.com/Idris173/Codex-Antigravity-Bridge.git</a> and check that it works. Then ask Codex to read the project guide in the background. I allow one reply. Tell me when it arrives.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-mac-1-prompt" aria-label="Copy Use a team Windows computer">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="both" aria-labelledby="en-mac-2-title">
+  <div class="card-head">
+    <h3 id="en-mac-2-title">Try the Mac preview</h3>
+    <span class="recipient">Ask either app</span>
+  </div>
+  <ol class="steps"><li>Install Python 3.11 or later on your Mac.</li><li>Install Codex CLI and Antigravity, then sign in to both.</li></ol><div class="card-links"><a href="https://github.com/Idris173/Codex-Antigravity-Bridge/tree/macos-headless">Open the Mac preview branch</a></div>
+  <p class="prompt-text" id="en-mac-2-prompt">Please get the macos-headless branch from <a href="https://github.com/Idris173/Codex-Antigravity-Bridge.git.">https://github.com/Idris173/Codex-Antigravity-Bridge.git.</a> Follow its instructions to set up the bridge on this Mac. Check both apps, then try one read-only message and see if it gets a reply.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-mac-2-prompt" aria-label="Copy Try the Mac preview">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="en-mac-3-title">
+  <div class="card-head">
+    <h3 id="en-mac-3-title">Pass messages by hand on a Mac</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+  <ol class="steps"><li>Install ChatGPT and Antigravity on your Mac. Open Codex in ChatGPT.</li><li>Open the same project in both apps. Copy Antigravity’s advice into Codex, then copy the result back.</li><li>Let one app edit at a time. Let the other app read and give feedback.</li></ol><div class="card-links"><a href="https://chatgpt.com/download/">Download ChatGPT</a> <a href="https://antigravity.google/download">Download Antigravity</a></div>
+  <p class="prompt-text" id="en-mac-3-prompt">Antigravity gave me this advice: <span class="variable">[paste the advice here]</span>. Please follow it in this project and tell me what you did.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-mac-3-prompt" aria-label="Copy Pass messages by hand on a Mac">Copy</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="en-pairing" aria-labelledby="en-pairing-title">
+  <h2 id="en-pairing-title">Connect the two apps</h2>
+
+  <div class="cards">
+<article class="card" data-audience="codex" aria-labelledby="en-pairing-1-title">
+  <div class="card-head">
+    <h3 id="en-pairing-1-title">Connect an Antigravity chat</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+
+  <p class="prompt-text" id="en-pairing-1-prompt">Please connect this folder to the Antigravity chat I picked. Tell me when they’re connected.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-pairing-1-prompt" aria-label="Copy Connect an Antigravity chat">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-pairing-2-title">
+  <div class="card-head">
+    <h3 id="en-pairing-2-title">Keep using the last chat</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-pairing-2-prompt">Please connect this folder to Codex. If it’s already connected to a chat, keep using that chat.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-pairing-2-prompt" aria-label="Copy Keep using the last chat">Copy</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="en-dispatch" aria-labelledby="en-dispatch-title">
+  <h2 id="en-dispatch-title">Ask for help</h2>
+
+  <div class="cards">
+<article class="card" data-audience="antigravity" aria-labelledby="en-dispatch-1-title">
+  <div class="card-head">
+    <h3 id="en-dispatch-1-title">Give Codex a job</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-dispatch-1-prompt">Please ask Codex to help me with this: <span class="variable">[what to do]</span>. Tell me when it’s done.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-dispatch-1-prompt" aria-label="Copy Give Codex a job">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-dispatch-2-title">
+  <div class="card-head">
+    <h3 id="en-dispatch-2-title">Ask Codex to take a look</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-dispatch-2-prompt">Please ask Codex to look at <span class="variable">[what to check]</span>. Keep the files as they are. I allow Codex to send one reply when it’s done.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-dispatch-2-prompt" aria-label="Copy Ask Codex to take a look">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="en-dispatch-3-title">
+  <div class="card-head">
+    <h3 id="en-dispatch-3-title">Ask Antigravity to review</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+
+  <p class="prompt-text" id="en-dispatch-3-prompt">Please send my changes to Antigravity. Ask it to read them and tell me if anything looks wrong. Tell me what it says.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-dispatch-3-prompt" aria-label="Copy Ask Antigravity to review">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-dispatch-4-title">
+  <div class="card-head">
+    <h3 id="en-dispatch-4-title">Reply to Codex</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-dispatch-4-prompt">Please find message <span class="variable">[message number]</span> from Codex. Check what it asked about and send it your answer.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-dispatch-4-prompt" aria-label="Copy Reply to Codex">Copy</button>
+  </div>
+</article>
+  </div>
+</section>
+<section class="group" id="en-models" aria-labelledby="en-models-title">
+  <h2 id="en-models-title">Change models or check progress</h2>
+
+  <div class="cards">
+<article class="card" data-audience="both" aria-labelledby="en-models-1-title">
+  <div class="card-head">
+    <h3 id="en-models-1-title">See which models I can use</h3>
+    <span class="recipient">Ask either app</span>
+  </div>
+
+  <p class="prompt-text" id="en-models-1-prompt">Please tell me which models each app can use and which ones are faster. Wait until I pick before you start.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-models-1-prompt" aria-label="Copy See which models I can use">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="en-models-2-title">
+  <div class="card-head">
+    <h3 id="en-models-2-title">Switch Antigravity to Neon</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+
+  <p class="prompt-text" id="en-models-2-prompt">Please switch this Antigravity chat to Neon with medium thinking. Then have the same chat say “Hello” and check that it really used Neon.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-models-2-prompt" aria-label="Copy Switch Antigravity to Neon">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-models-3-title">
+  <div class="card-head">
+    <h3 id="en-models-3-title">Change the Codex model</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-models-3-prompt">Please have the connected Codex chat use <span class="variable">[the model I want]</span> next time. Keep using the same chat.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-models-3-prompt" aria-label="Copy Change the Codex model">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="codex" aria-labelledby="en-models-4-title">
+  <div class="card-head">
+    <h3 id="en-models-4-title">Did my message arrive?</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+
+  <p class="prompt-text" id="en-models-4-prompt">Did my last message get to Antigravity? Has it replied yet?</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-models-4-prompt" aria-label="Copy Did my message arrive?">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-models-5-title">
+  <div class="card-head">
+    <h3 id="en-models-5-title">Is Codex done?</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-models-5-prompt">Has Codex finished the last job? Which model did it use?</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-models-5-prompt" aria-label="Copy Is Codex done?">Copy</button>
+  </div>
+</article>
+  </div>
+</section>
+</div>
+  </main>
+  <footer>
+    <div class="wrap">
+      <a id="guide-link" href="https://github.com/Idris173/Codex-Antigravity-Bridge/blob/main/README.zh-CN.md">项目说明</a>
+    </div>
+  </footer>
+  <div class="sr-only" id="status" role="status"></div>
+  <script>
+    const status = document.getElementById('status');
+    const viewButtons = document.querySelectorAll('[data-view]');
+    const languageButtons = document.querySelectorAll('[data-language]');
+    const panes = document.querySelectorAll('[data-language-pane]');
+    const strings = {
+      'zh-CN': {
+        title: '这些话可以直接说', tip: '点「复制」，发给卡片上写的那一边。方括号里的字换成你自己的。',
+        language: '语言', view: '选择视角', views: ['全部', 'Codex 视角', '反重力视角'],
+        guide: '项目说明', readme: 'README.zh-CN.md',
+        copy: '复制', copied: '已复制', selected: '已选中，请手动复制',
+        copyStatus: '这句话已复制。', selectionStatus: '这句话已选中，请按 Ctrl+C 或 Command+C。',
+      },
+      en: {
+        title: 'Things you can say', tip: 'Click Copy, then send the message to the app on the card. Replace the words in brackets.',
+        language: 'Language', view: 'Choose a view', views: ['All', 'Codex view', 'Antigravity view'],
+        guide: 'Project guide', readme: 'README.md',
+        copy: 'Copy', copied: 'Copied', selected: 'Selected for copying',
+        copyStatus: 'Message copied.', selectionStatus: 'Message selected. Press Ctrl+C or Command+C.',
+      },
+    };
+    let language = 'zh-CN';
+    let view = 'all';
+
+    function showView() {
+      for (const button of viewButtons) {
+        button.setAttribute('aria-pressed', String(button.dataset.view === view));
+      }
+      const activePane = [...panes].find(pane => pane.dataset.languagePane === language);
+      let visible = 0;
+      for (const group of activePane.querySelectorAll('.group')) {
+        let groupVisible = 0;
+        for (const card of group.querySelectorAll('.card')) {
+          const recipient = card.dataset.audience;
+          card.hidden = view !== 'all' && recipient !== 'both' && recipient !== view;
+          if (!card.hidden) groupVisible++;
+        }
+        group.hidden = groupVisible === 0;
+        visible += groupVisible;
+      }
+      status.textContent = language === 'en' ? visible + ' messages shown.' : '显示 ' + visible + ' 句话。';
+    }
+
+    function showLanguage(nextLanguage) {
+      language = nextLanguage;
+      const text = strings[language];
+      document.documentElement.lang = language;
+      document.title = text.title + ' · Codex–Antigravity Bridge';
+      document.getElementById('page-heading').textContent = text.title;
+      document.getElementById('page-tip').textContent = text.tip;
+      document.querySelector('.languages').setAttribute('aria-label', text.language);
+      document.querySelector('.views').setAttribute('aria-label', text.view);
+      const guide = document.getElementById('guide-link');
+      guide.textContent = text.guide;
+      guide.href = 'https://github.com/Idris173/Codex-Antigravity-Bridge/blob/main/' + text.readme;
+      viewButtons.forEach((button, index) => { button.textContent = text.views[index]; });
+      languageButtons.forEach(button => {
+        button.setAttribute('aria-pressed', String(button.dataset.language === language));
+      });
+      panes.forEach(pane => { pane.hidden = pane.dataset.languagePane !== language; });
+      showView();
+    }
+
+    for (const button of viewButtons) {
+      button.addEventListener('click', () => {
+        view = button.dataset.view;
+        showView();
+      });
+    }
+
+    for (const button of languageButtons) {
+      button.addEventListener('click', () => showLanguage(button.dataset.language));
+    }
+
+    function selectText(element) {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+
+    async function copyPrompt(button) {
+      const text = strings[button.closest('[data-language-pane]').dataset.languagePane];
+      const element = document.getElementById(button.dataset.copy);
+      const plainText = element.textContent.trim();
+      let copied = false;
+      if (navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(plainText);
+          copied = true;
+        } catch {
+          // Some browsers restrict clipboard writes from local files.
+        }
+      }
+      if (!copied) {
+        selectText(element);
+        try { copied = document.execCommand('copy'); } catch {}
+        if (copied) window.getSelection().removeAllRanges();
+      }
+      button.textContent = copied ? text.copied : text.selected;
+      status.textContent = copied ? text.copyStatus : text.selectionStatus;
+      if (!copied) return;
+      setTimeout(() => { button.textContent = text.copy; }, 1400);
+    }
+
+    for (const button of document.querySelectorAll('[data-copy]')) {
+      button.addEventListener('click', () => copyPrompt(button));
+    }
+    showLanguage(new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'zh-CN');
+  </script>
+</body>
+</html>
