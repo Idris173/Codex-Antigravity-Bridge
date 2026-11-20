@@ -24,7 +24,7 @@ PYTHON = str(Path(sys.executable).resolve())
 
 class TemporaryHomeTest(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(prefix="codex director 隔离 ")
+        temp = tempfile.TemporaryDirectory(prefix="codex antigravity bridge 隔离 ")
         self.addCleanup(temp.cleanup)
         self.layout = install.Layout(Path(temp.name).resolve())
 
@@ -53,6 +53,24 @@ class TemporaryHomeTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"), "Requires Windows PowerShell and UI Automation assemblies")
 class InstallerAndBusTests(TemporaryHomeTest):
+    def test_upgrade_archives_legacy_skill_directories(self):
+        legacy_directories = []
+        for (_, destination), name in zip(self.layout.skills, ("codex-director", "director-worker")):
+            legacy = destination.with_name(name)
+            self.seed(legacy / "SKILL.md", f"---\nname: {name}\n---\n".encode())
+            self.seed(legacy / "local-notes.md", b"keep local edits")
+            legacy_directories.append(legacy)
+
+        self.cli()
+        for legacy in legacy_directories:
+            self.assertFalse(legacy.exists())
+            archived, = self.layout.bridge.glob(f"{legacy.name}.*.bak")
+            self.assertEqual((archived / "local-notes.md").read_bytes(), b"keep local edits")
+
+        self.assertNotIn("Backup:", self.cli().stdout)
+        health = json.loads(self.cli("--doctor").stdout)
+        self.assertTrue(health["ok"], health)
+
     def test_distributed_lifecycle(self):
         gemini = {
             "mcpServers": {"friend-gemini": {"command": "friend", "args": ["--with spaces"]}},
@@ -116,6 +134,10 @@ name = "Existing"
         health = json.loads(self.cli("--doctor").stdout)
         self.assertTrue(health["ok"], health)
         self.assertTrue(all(check["ok"] for check in health["checks"].values()), health)
+        for source, destination in self.layout.skills:
+            skill = health["checks"][f"{source.parent.name}_skill"]
+            self.assertEqual(Path(skill["path"]), destination)
+            self.assertEqual(destination.name, "codex-antigravity-bridge")
         self.assertEqual(set(health["checks"]["antigravity_mcp"]["tools"]), install.TOOLS[install.AGY])
         self.assertEqual(set(health["checks"]["codex_mcp"]["tools"]), install.TOOLS[install.CODEX])
 
@@ -125,6 +147,7 @@ name = "Existing"
                 self.assertEqual(module["detect_language"](prompt), language)
                 envelope = module["build_director_envelope"]("general", prompt, prompt)
                 self.assertIn(f"\n[LANG: {language}]\n", envelope)
+                self.assertIn("Activate `codex-antigravity-bridge`", envelope)
 
         routing_args = {"codex_home": str(self.layout.codex.parent)}
         configured = self.tool(worker, install.CODEX, "agy_routing_settings", {

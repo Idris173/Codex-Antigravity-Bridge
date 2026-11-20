@@ -12,7 +12,13 @@
     [int]$TargetHwnd = 0,
     [int]$TargetPid = 0,
     [int]$TimeoutSec = 180,
-    [bool]$AllowPlaceholderTitle = ($env:CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE -eq "1")
+    [bool]$AllowPlaceholderTitle = $(
+        if ($null -ne $env:CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE) {
+            $env:CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE -eq "1"
+        } else {
+            $env:CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE -eq "1"
+        }
+    )
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,12 +52,12 @@ if ($null -eq $loadedUiaType) {
     if ($DispatchId)     { $childArgs += @("-DispatchId", $DispatchId) }
     if ($TargetHwnd)     { $childArgs += @("-TargetHwnd", [string]$TargetHwnd) }
     if ($TargetPid)      { $childArgs += @("-TargetPid", [string]$TargetPid) }
-    $prevEnv = $env:CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE
+    $prevEnv = $env:CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE
     try {
-        $env:CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE = if ($AllowPlaceholderTitle) { "1" } else { "0" }
+        $env:CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE = if ($AllowPlaceholderTitle) { "1" } else { "0" }
         & powershell.exe @childArgs
     } finally {
-        $env:CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE = $prevEnv
+        $env:CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE = $prevEnv
     }
     return
 }

@@ -1,10 +1,10 @@
 ---
-name: director-worker
+name: codex-antigravity-bridge
 description: >-
   Executes structured tasks when the first non-empty line is [DIRECTOR_TASK], or when the user explicitly requests submission to Antigravity for review.
 ---
 
-# Director Worker Protocol (`director-worker`)
+# Codex-Antigravity-Bridge — Codex 执行端
 
 ## 1. Activation Guard (严格按需触发)
 

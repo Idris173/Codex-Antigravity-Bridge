@@ -1,9 +1,9 @@
-# Codex Director (`codex-director`)
+# Codex-Antigravity-Bridge
 
 **Antigravity (Tech Director) ↔ ChatGPT / Codex (Worker) Bidirectional Local MCP & Game Dev Skill Suite**  
 面向游戏制作者（Unreal Engine & Three.js）的 **Antigravity（反重力技术总监）↔ ChatGPT / Codex（执行主程）** 本机双边对称 MCP 与按需技能套件。
 
-Repository: [https://github.com/Idris173/codex-director](https://github.com/Idris173/codex-director)
+Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
 ---
 
@@ -14,13 +14,13 @@ Repository: [https://github.com/Idris173/codex-director](https://github.com/Idri
 
 ### One-Command Identical Install (via Antigravity OR ChatGPT/Codex)
 Clone this repo or tell **either** Antigravity or ChatGPT/Codex:
-> *"Clone `https://github.com/Idris173/codex-director` and install this skill suite for me."*
+> *"Clone `https://github.com/Idris173/Codex-Antigravity-Bridge` and install this skill suite for me."*
 
 Both agents automatically read `AGENTS.md` and run the deterministic installer:
 
 ```powershell
-git clone https://github.com/Idris173/codex-director.git
-cd codex-director
+git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
+cd Codex-Antigravity-Bridge
 python install.py
 python install.py --doctor
 ```
@@ -32,7 +32,7 @@ python install.py --doctor
 
 - Use `bridge_routing_settings` in Antigravity or `agy_routing_settings` in Codex to choose the host, model, reasoning effort, and speed for the decision and worker roles. The planning prompt is enabled by default. GPT-6.2-Sol supports Standard, Fast, and Ultrafast. Saved choices appear in the task's `[ROUTING: ...]` header. Configure the chosen model and speed in the corresponding client.
 - Filter review submissions by `workspace_path`. Include a `request_id` when replying to an inbox with multiple pending requests. Add `--only-new` to `cli wait_inbox` to wait for submissions that arrive after the command starts.
-- Reinstalling retains `director_settings.json`. Uninstall preserves user-added files and saved routing choices. If the UI Automation DLL is in use, exit the host and rerun `--uninstall`.
+- Upgrading archives the previous skill folders under `~/.gemini/config/sidecars/chatgpt-bridge/`. Reinstalling retains `director_settings.json`. Uninstall preserves user-added files and saved routing choices. If the UI Automation DLL is in use, exit the host and rerun `--uninstall`.
 
 ---
 
@@ -52,27 +52,27 @@ python install.py --doctor
 
 无论你的朋友在 **反重力（Antigravity）** 还是在 **ChatGPT（Codex）** 中操作，只需对任意一方说：
 
-> “克隆或打开 `https://github.com/Idris173/codex-director`，帮我安装并验证这套双边技能。”
+> “克隆或打开 `https://github.com/Idris173/Codex-Antigravity-Bridge`，帮我安装并验证这套双边技能。”
 
 或者直接在终端执行：
 
 ```powershell
-git clone https://github.com/Idris173/codex-director.git
-cd codex-director
+git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
+cd Codex-Antigravity-Bridge
 python install.py
 python install.py --doctor
 ```
 
 > **首次安装提示**：安装脚本会自动备份并无损合并原有的 `~/.gemini/config/mcp_config.json` 与 `~/.codex/config.toml`（保留你已有的全部其他 MCP 服务）。若安装时 ChatGPT 桌面应用已打开，请**重启一次 ChatGPT 桌面应用**以加载原生 `antigravity_bridge` 工具。
 
-重新安装会保留 `director_settings.json`。运行 `python install.py --uninstall` 会保留用户附加文件与已保存的选型。若 UI 自动化 DLL 正被占用，退出宿主后重跑卸载。
+升级时，安装器会把旧版技能目录备份到 `~/.gemini/config/sidecars/chatgpt-bridge/`。重新安装会保留 `director_settings.json`。运行 `python install.py --uninstall` 会保留用户附加文件与已保存的选型。若 UI 自动化 DLL 正被占用，退出宿主后重跑卸载。
 
 ---
 
 ## Repository Layout / 目录结构
 
 ```text
-codex-director/
+Codex-Antigravity-Bridge/
 ├── AGENTS.md                   # Deterministic setup guide for both Antigravity & Codex
 ├── README.md                   # Bilingual documentation (EN / zh-CN)
 ├── install.py                  # Zero-dependency installer / --doctor / --uninstall
@@ -83,8 +83,8 @@ codex-director/
 │   ├── uia_driver.ps1
 │   └── uia_daemon.ps1
 ├── skills/
-│   ├── antigravity/codex-director/  # Installed to ~/.gemini/config/skills/codex-director/
-│   └── codex/director-worker/       # Installed to ~/.codex/skills/director-worker/
+│   ├── antigravity/codex-antigravity-bridge/  # Installed to ~/.gemini/config/skills/codex-antigravity-bridge/
+│   └── codex/codex-antigravity-bridge/        # Installed to ~/.codex/skills/codex-antigravity-bridge/
 └── tests/                      # Isolated automated test suite
 ```
 

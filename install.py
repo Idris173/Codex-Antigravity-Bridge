@@ -1,4 +1,4 @@
-"""Install, inspect, or remove the local Codex Director suite (Python 3.11+)."""
+"""Install, inspect, or remove the local Codex-Antigravity-Bridge suite (Python 3.11+)."""
 
 import argparse
 import json
@@ -22,6 +22,7 @@ SOURCE = Path(__file__).resolve().parent
 BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
+SKILL_NAME = "codex-antigravity-bridge"
 CODEX_TABLE = ("mcp_servers", CODEX)
 UTF8_ENV = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 TOOLS = {
@@ -96,8 +97,8 @@ class Layout:
     @property
     def skills(self):
         return (
-            (SOURCE / "skills/antigravity/codex-director", self.home / ".gemini/config/skills/codex-director"),
-            (SOURCE / "skills/codex/director-worker", self.home / ".codex/skills/director-worker"),
+            (SOURCE / "skills/antigravity" / SKILL_NAME, self.home / ".gemini/config/skills" / SKILL_NAME),
+            (SOURCE / "skills/codex" / SKILL_NAME, self.home / ".codex/skills" / SKILL_NAME),
         )
 
     def check_path(self, path):
@@ -412,11 +413,11 @@ def copy_assets(layout):
 COMPILE_DLL = """
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Windows.Forms
-Add-Type -Path $env:CODEX_DIRECTOR_CS_SOURCE -ReferencedAssemblies 'UIAutomationClient','UIAutomationTypes','WindowsBase','System.Core' -OutputAssembly $env:CODEX_DIRECTOR_DLL_PATH
+Add-Type -Path $env:CODEX_ANTIGRAVITY_BRIDGE_CS_SOURCE -ReferencedAssemblies 'UIAutomationClient','UIAutomationTypes','WindowsBase','System.Core' -OutputAssembly $env:CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH
 """
 CHECK_DLL = """
 $ErrorActionPreference = 'Stop'
-$assembly = [Reflection.Assembly]::ReflectionOnlyLoadFrom($env:CODEX_DIRECTOR_DLL_PATH)
+$assembly = [Reflection.Assembly]::ReflectionOnlyLoadFrom($env:CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH)
 [void]$assembly.GetType('BridgeFastUia', $true)
 """
 
@@ -436,7 +437,7 @@ def compile_dll(layout, changed):
     source = layout.bridge / "BridgeFastUia.cs"
     if not changed and dll.is_file() and dll.stat().st_mtime_ns >= source.stat().st_mtime_ns:
         try:
-            run_powershell(CHECK_DLL, {"CODEX_DIRECTOR_DLL_PATH": str(dll)})
+            run_powershell(CHECK_DLL, {"CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(dll)})
             return True
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
@@ -444,7 +445,7 @@ def compile_dll(layout, changed):
         with tempfile.TemporaryDirectory(dir=layout.bridge, prefix=".compile-") as directory:
             built = Path(directory) / dll.name
             run_powershell(COMPILE_DLL, {
-                "CODEX_DIRECTOR_CS_SOURCE": str(source), "CODEX_DIRECTOR_DLL_PATH": str(built),
+                "CODEX_ANTIGRAVITY_BRIDGE_CS_SOURCE": str(source), "CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(built),
                 "TEMP": directory, "TMP": directory,
             })
             try:
@@ -467,6 +468,20 @@ def compile_dll(layout, changed):
     return True
 
 
+def archive_legacy_skills(layout):
+    archives = []
+    for (_, destination), legacy_name in zip(layout.skills, ("codex-director", "director-worker")):
+        legacy = layout.check_path(destination.with_name(legacy_name))
+        document = read_bytes(layout.check_path(legacy / "SKILL.md"))
+        if document is None or f"name: {legacy_name}".encode() not in document.splitlines()[:2]:
+            continue
+        archive = layout.check_path(layout.bridge / f"{legacy_name}.{time.time_ns()}.bak")
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        legacy.rename(archive)
+        archives.append(archive)
+    return archives
+
+
 def confirm_python(python):
     completed = subprocess.run(
         [str(python), "-B", "-I", "-c", "import sys; raise SystemExit(sys.version_info < (3, 11))"],
@@ -484,7 +499,7 @@ def install(layout, python):
     if not layout.state.exists():
         atomic_write(layout.state, json_bytes(state))
     backups = [backup for path, old, new in edits if (backup := write_config(path, old, new))]
-    return backups, dll_ok
+    return backups + archive_legacy_skills(layout), dll_ok
 
 
 class LockedBridgeLibrary(PermissionError):
@@ -531,6 +546,7 @@ def uninstall(layout):
         layout.check_path(path).unlink(missing_ok=True)
 
     backups = [backup for path, old, new in edits if (backup := write_config(path, old, new))]
+    backups.extend(archive_legacy_skills(layout))
     layout.state.unlink(missing_ok=True)
     for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
         layout.check_path(directory)
@@ -582,7 +598,7 @@ def exchange_mcp(entry, server_name, method, params=None):
             protocol = "2025-06-18"
             send("initialize", {
                 "protocolVersion": protocol, "capabilities": {},
-                "clientInfo": {"name": "codex-director-doctor", "version": "1"},
+                "clientInfo": {"name": "codex-antigravity-bridge-doctor", "version": "1"},
             }, 1)
             info = receive(1)
             if info.get("serverInfo", {}).get("name") != server_name or info.get("protocolVersion") != protocol:
@@ -611,14 +627,14 @@ def doctor(layout):
             read_bytes(layout.check_path(destination / file.relative_to(source))) == file.read_bytes()
             for file in expected_files
         )
-        result(destination.name, good, path=str(destination))
+        result(f"{source.parent.name}_skill", good, path=str(destination))
 
     script_paths = [layout.check_path(layout.bridge / file) for file in BRIDGE_FILES]
     bridge_ok = all(read_bytes(path) == (SOURCE / "bridge" / path.name).read_bytes() for path in script_paths)
     result("bridge_files", bridge_ok, path=str(layout.bridge))
     dll = layout.check_path(layout.bridge / "BridgeFastUia.dll")
     try:
-        run_powershell(CHECK_DLL, {"CODEX_DIRECTOR_DLL_PATH": str(dll)})
+        run_powershell(CHECK_DLL, {"CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(dll)})
         fresh = dll.stat().st_mtime_ns >= (layout.bridge / "BridgeFastUia.cs").stat().st_mtime_ns
         result("uia_dll", fresh, path=str(dll))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -661,7 +677,7 @@ def doctor(layout):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Install, diagnose, or uninstall the Codex Director suite.")
+    parser = argparse.ArgumentParser(description="Install, diagnose, or uninstall the Codex-Antigravity-Bridge suite.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--doctor", action="store_true", help="Report both MCP handshakes as JSON.")
     modes.add_argument("--uninstall", action="store_true", help="Remove the suite and its local bridge state.")

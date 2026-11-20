@@ -3,7 +3,7 @@
 """
 headless_multi_engine.py:
 Multi-session concurrent registry, dual-minimized headless `codex.exe exec` engine,
-short-lived UIA injection mutex, and workspace-isolated inbox filtering for codex-director.
+short-lived UIA injection mutex, and workspace-isolated inbox filtering for Codex-Antigravity-Bridge.
 
 Zero external third-party dependencies (Python 3.11+ standard library on Windows).
 """
@@ -177,13 +177,14 @@ def normalize_speed_tier(speed: str) -> str:
 def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]:
     """
     Dynamically locate Windows OpenAI Codex CLI (`codex.exe`):
-    1) Explicit `codex_exe` argument or `CODEX_DIRECTOR_CODEX_EXE` / `CODEX_EXE` environment variable
+    1) Explicit `codex_exe` argument or `CODEX_ANTIGRAVITY_BRIDGE_CODEX_EXE` / `CODEX_EXE` environment variable
     2) `shutil.which("codex")` or `shutil.which("codex.exe")`
     3) PowerShell `Get-AppxPackage -Name "OpenAI.Codex"` InstallLocation + `\\app\\resources\\codex.exe`
     4) Fallback scan `C:\\Program Files\\WindowsApps\\OpenAI.Codex_*\\app\\resources\\codex.exe` (newest version first)
     """
     explicit_candidates = [
         codex_exe,
+        os.environ.get("CODEX_ANTIGRAVITY_BRIDGE_CODEX_EXE"),
         os.environ.get("CODEX_DIRECTOR_CODEX_EXE"),
         os.environ.get("CODEX_EXE"),
     ]

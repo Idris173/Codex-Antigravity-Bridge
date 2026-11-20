@@ -1,6 +1,6 @@
 # 游戏开发双引擎代码审查清单（Unreal Engine & Three.js）
 
-在 `codex-director` 工作流中，每次收到 ChatGPT/Codex 执行端返回的 `[FILES]` 与 `[SELF_CHECK]` 后，按当前绑定引擎逐项核查以下红线。若发现违规，生成具体、可定位到行/函数的修改建议打回返工。
+在 `codex-antigravity-bridge` 工作流中，每次收到 ChatGPT/Codex 执行端返回的 `[FILES]` 与 `[SELF_CHECK]` 后，按当前绑定引擎逐项核查以下红线。若发现违规，生成具体、可定位到行/函数的修改建议打回返工。
 
 ---
 

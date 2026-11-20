@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-chatgpt-bridge / antigravity_bridge (v2.3 Release):
+Codex-Antigravity-Bridge (v2.3 Release):
 Bidirectional local MCP Server & IPC bus between Antigravity (Tech Director) and OpenAI Codex Desktop (Worker).
 - Role 'antigravity' (default): Window gatekeeper, 266ms fast UIA + 35ms lossless JSONL dispatch, and Codex inbox review tools.
 - Role 'codex' (--role codex): Native MCP submission/reply tools so Codex NEVER needs `computer-use` GUI clicking.
@@ -313,7 +313,7 @@ def _run_ps_driver(
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
-                env={**os.environ, "CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE": str(int(allow_placeholder_title))},
+                env={**os.environ, "CODEX_ANTIGRAVITY_BRIDGE_ALLOW_PLACEHOLDER_TITLE": str(int(allow_placeholder_title))},
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -612,7 +612,7 @@ def build_director_envelope(
     if local_context.strip():
         lines.append(f"[LOCAL_CONTEXT]\n{local_context.strip()}")
     lines.append(
-        "[PROTOCOL_REMINDER] Activate `director-worker` skill rules. Reply strictly with sections: "
+        "[PROTOCOL_REMINDER] Activate `codex-antigravity-bridge` skill rules. Reply strictly with sections: "
         f"[SUMMARY], [FILES], [SELF_CHECK], [OPEN_QUESTIONS] (write NONE if no blocking questions). {lang_rule}"
     )
     lines.append("[/DIRECTOR_TASK]")
@@ -1371,7 +1371,7 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
                 "step_summary": {"type": "string", "description": "本步完成情况摘要。"},
                 "changed_files": {"type": "string", "description": "新增或修改的文件路径列表。"},
                 "code_or_diff": {"type": "string", "description": "关键代码片段或 git diff 内容。"},
-                "self_check": {"type": "string", "description": "按 director-worker 规范执行的引擎红线自检说明。"},
+                "self_check": {"type": "string", "description": "按 codex-antigravity-bridge 规范执行的引擎红线自检说明。"},
                 "open_questions": {"type": "string", "description": "需技术总监或制作人裁决的问题，无则填 NONE。"},
                 "workspace_path": {"type": "string", "description": "当前工程根目录路径。"},
                 "wait_for_reply": {
@@ -1647,7 +1647,7 @@ def run_cli(argv: list[str]) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    parser = argparse.ArgumentParser(description="chatgpt-bridge / antigravity_bridge CLI")
+    parser = argparse.ArgumentParser(description="Codex-Antigravity-Bridge CLI")
     sub = parser.add_subparsers(dest="subcmd", required=True)
 
     sub.add_parser("inspect")

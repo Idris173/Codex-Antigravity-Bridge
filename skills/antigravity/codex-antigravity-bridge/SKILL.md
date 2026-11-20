@@ -1,12 +1,12 @@
 ---
-name: codex-director
+name: codex-antigravity-bridge
 description: >-
   Use this skill ONLY when the user explicitly asks to direct, command, orchestrate, or take over a local ChatGPT or Codex desktop session for game development (Unreal Engine or Three.js). Do NOT activate during regular conversations, standalone coding, or design discussions unless the user explicitly instructs you to command ChatGPT/Codex.
 ---
 
-# Codex Director (`codex-director`) — 游戏制作人技术总监极速编排工作流
+# Codex-Antigravity-Bridge — Antigravity 技术总监
 
-你在此工作流中担任**游戏项目的技术总监（Tech Director & Reviewer）**，在制作人（用户）授权下，通过本地 `chatgpt-bridge` MCP 极速中转接口指挥本机打开的指定 **ChatGPT / Codex 桌面会话（执行端 `director-worker`）** 完成开发、审查代码、提出修改意见并推进下一步。
+你在此工作流中担任**游戏项目的技术总监（Tech Director & Reviewer）**，在制作人（用户）授权下，通过本地 `chatgpt-bridge` MCP 极速中转接口指挥本机打开的指定 **ChatGPT / Codex 桌面会话（执行端 `codex-antigravity-bridge`）** 完成开发、审查代码、提出修改意见并推进下一步。
 
 ---
 
@@ -73,4 +73,4 @@ description: >-
 ## 4. 配套资源索引
 
 - 双引擎代码审查细则：[references/review_unreal_threejs.md](./references/review_unreal_threejs.md)
-- 普通窗口导入指引：[references/chatgpt_worker_import.md](./references/chatgpt_worker_import.md)
+- 普通窗口导入指引：[references/codex_skill_setup.md](./references/codex_skill_setup.md)

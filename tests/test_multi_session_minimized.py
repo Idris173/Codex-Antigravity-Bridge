@@ -567,7 +567,7 @@ class HeadlessMultiSessionMinimizedTests(unittest.TestCase):
                 LATEST_TO_CODEX_FILE=bus_dir / "to_codex_latest.json",
                 LOCK_FILE=self.base_dir / "session_lock.json",
             ),
-            mock.patch.dict(os.environ, {"CODEX_DIRECTOR_CODEX_EXE": str(self.stub_codex)}),
+            mock.patch.dict(os.environ, {"CODEX_ANTIGRAVITY_BRIDGE_CODEX_EXE": str(self.stub_codex)}),
         ):
             bridge_server._dispatch_mcp_tool(
                 "antigravity",
