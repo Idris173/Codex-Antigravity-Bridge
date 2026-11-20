@@ -6,6 +6,8 @@ A general-purpose local MCP communication bridge between **OpenAI Codex** (ChatG
 
 Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
+[Prompt guide](./docs/bridge-prompts.html). Download the HTML file and open it in your browser to copy examples in English or Simplified Chinese.
+
 ---
 
 ## Overview
@@ -29,6 +31,8 @@ Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://githu
 - **Google Antigravity**
 - **OpenAI ChatGPT Desktop App** (with Codex enabled)
 
+On macOS, see the [headless preview branch](https://github.com/Idris173/Codex-Antigravity-Bridge/tree/macos-headless). The preview's POSIX tests ran under WSL. A full test with the live apps on a Mac remains pending.
+
 ---
 
 ## Installation & Health Check
@@ -47,6 +51,8 @@ What `install.py` configures non-destructively:
 1. Copies the bridge runtime (`bridge_server.py`, `headless_multi_engine.py`, `notify_inbox.py`, `agy_model_guard.py`, `codex_projects.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll`.
 2. Installs the on-demand skills to `~/.gemini/config/skills/codex-antigravity-bridge/` and `~/.codex/skills/codex-antigravity-bridge/`.
 3. Creates timestamped `.bak` backups before non-destructively merging `chatgpt-bridge` into `~/.gemini/config/mcp_config.json` and `[mcp_servers.antigravity_bridge]` into `~/.codex/config.toml` (preserving all existing MCP servers).
+
+If Antigravity's MCP configuration is blank, the installer saves it as a `.bak` file and initializes valid JSON. If the file has content and contains invalid JSON, installation stops before writing configuration.
 
 > **First-Install Note**: If the ChatGPT Desktop App is already running during first install, **restart the ChatGPT Desktop App once** so Codex loads the `antigravity_bridge` MCP server.
 

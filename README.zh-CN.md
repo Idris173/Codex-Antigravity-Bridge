@@ -6,6 +6,8 @@
 
 仓库地址：[https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
+[提示词速查页](./docs/bridge-prompts.html)。下载 HTML 后用浏览器打开，即可切换中英文，复制安装、派发、切模等常用说法。
+
 ---
 
 ## 项目概览
@@ -29,6 +31,8 @@
 - **Google Antigravity**
 - **OpenAI ChatGPT 桌面应用**（开启 Codex 功能）
 
+使用 Mac 的同事可查看 [macOS 无头预览分支](https://github.com/Idris173/Codex-Antigravity-Bridge/tree/macos-headless)。预览已在 WSL 通过 POSIX 测试，Mac 实机上的应用联调仍待验证。
+
 ---
 
 ## 安装与健康检查
@@ -47,6 +51,8 @@ python install.py --doctor
 1. 将桥接运行时（`bridge_server.py`、`headless_multi_engine.py`、`notify_inbox.py`、`agy_model_guard.py`、`codex_projects.py`、`BridgeFastUia.cs`、`uia_driver.ps1`、`uia_daemon.ps1`）部署至 `~/.gemini/config/sidecars/chatgpt-bridge/`，并使用本机 `.NET` 工具链预编译 `BridgeFastUia.dll`。
 2. 将双侧按需技能分别安装至 `~/.gemini/config/skills/codex-antigravity-bridge/` 与 `~/.codex/skills/codex-antigravity-bridge/`。
 3. 在修改配置前自动生成带时间戳的 `.bak` 备份，并将 `chatgpt-bridge` 与 `[mcp_servers.antigravity_bridge]` 无损合并至 `~/.gemini/config/mcp_config.json` 和 `~/.codex/config.toml`（完整保留已有的全部其他 MCP 服务）。
+
+如果 Antigravity 的 MCP 配置文件是空的，安装器会先生成 `.bak` 备份，再写入有效的 JSON。文件已有内容但 JSON 格式有误时，安装会在写入配置前停止。
 
 > **首次安装提示**：若首次安装时 ChatGPT 桌面应用已处于打开状态，请**重启一次 ChatGPT 桌面应用**以加载新注册的 `antigravity_bridge` MCP 工具。
 
