@@ -211,6 +211,20 @@ name = "Existing"
         self.assertFalse(self.layout.bridge.exists())
         self.assertFalse(list(self.layout.codex.parent.glob("*.bak")))
 
+    def test_blank_mcp_config_is_initialized_and_backed_up(self):
+        self.seed(self.layout.gemini, b"")
+
+        self.cli()
+
+        config = json.loads(self.layout.gemini.read_bytes())
+        self.assertEqual(config["mcpServers"][install.AGY]["args"],
+                         [str(self.layout.server), "--role", "antigravity"])
+        backup, = self.layout.gemini.parent.glob("mcp_config.json.*.bak")
+        self.assertEqual(backup.read_bytes(), b"")
+        self.assertNotIn("Backup:", self.cli().stdout)
+        health = json.loads(self.cli("--doctor").stdout)
+        self.assertTrue(health["ok"], health)
+
     def test_library_replacement_can_be_deferred(self):
         self.cli()
         dll = self.layout.bridge / "BridgeFastUia.dll"
@@ -245,6 +259,15 @@ name = "Existing"
 
 
 class MergeAndLocaleTests(TemporaryHomeTest):
+    def test_blank_mcp_config_with_whitespace_or_bom(self):
+        entry = install.registry_entry(Path(PYTHON), self.layout.server, "antigravity")
+        for original in (b" \r\n\t", b"\xef\xbb\xbf \n"):
+            with self.subTest(original=original):
+                updated = install.edit_json(original, self.layout.server, entry, {})
+                self.assertEqual(json.loads(updated), {"mcpServers": {install.AGY: entry}})
+        with self.assertRaises(json.JSONDecodeError):
+            install.edit_json(b'{"mcpServers":', self.layout.server, entry, {})
+
     def test_opt_in_antigravity_notifications_preserve_other_sidecars(self):
         initial = {"sidecars": {"unrelated": {"enabled": True}}, "other": "keep"}
         self.seed(self.layout.antigravity_config, install.json_bytes(initial))
