@@ -173,23 +173,66 @@ python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli reply
    ```
 
 2. **适用条件与运行机制**：
-   - 安装器会写入 `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json`，并在 `~/.gemini/config/config.json` 中启用 `sidecars.chatgpt-bridge`。
-   - 该功能依赖 Antigravity Sidecar 运行环境 `PATH` 中的 `agentapi` 命令；当该工作区到达新的待处理 `request_id` 时，后台监听器通过 `agentapi send-message <conversation-id> ...` 通知目标会话，目标会话在其现有权限范围内调用 `bridge_check_codex_inbox` 读取并通过 `bridge_reply_to_codex` 按原 `request_id` 回复。
-   - 若修改配置后 Sidecar 未立即启动，请重启一次 Antigravity。
+   - 安装器会写入 `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json`、在 `~/.gemini/config/config.json` 中启用 `sidecars.chatgpt-bridge`，并在 `~/.gemini/config/hooks.json` 中注册 `codex-antigravity-bridge-model` 生命周期钩子（存在 Sidecar 时 `--doctor` 会同步校验该钩子）。
+   - 该功能依赖 Antigravity Sidecar 运行环境 `PATH` 中的 `agentapi` 命令；当该工作区到达新的待处理 `request_id` 时，后台监听器通过 `agentapi send-message <conversation-id> ...` 通知目标会话。
+   - 普通请求通过 `bridge_check_codex_inbox` 读取，指定模型的受保护请求通过 `bridge_claim_codex_request` 领取，并在会话现有权限范围内调用 `bridge_reply_to_codex` 按原 `request_id` 回复。
+   - 若修改配置后 Sidecar 或钩子未立即生效，请重启一次 Antigravity。
    - 如需暂停自动通知，将 `~/.gemini/config/config.json` 中的 `sidecars.chatgpt-bridge.enabled` 设为 `false` 即可。
 
 ### 配对工作区
 
-在 Codex 中调用 `agy_workspace_pair`，传入 `action="link"`、已有目录的绝对路径和 Antigravity 会话 ID。用 `action="get"` 查看原生元数据是否已确认目录。多个已确认的目录可以分别绑定不同会话。首次缺少项目时，在 Antigravity 中添加对应文件夹。使用 `action="open"` 另开 Antigravity 会话时，已确认的项目需要与 Sidecar 配置的 `projectId` 一致。
+- **Codex → Antigravity（`agy_workspace_pair`）**：
+  1. 先确保目标文件夹已在 Antigravity 中作为工作区/项目打开，然后调用 `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", conversation_id="<conversation_id>")`。
+  2. 调用 `agy_workspace_pair(action="get", workspace_path="C:/path/to/workspace")` 查询状态，直至原生 `agentapi get-conversation-metadata` 核验目录通过并变为 `route.status == "confirmed"`。多个已确认目录可分别路由到各自的 Antigravity 会话。
+  3. 调用 `action="open"` 尝试新建配对会话时，要求 `route.project_id` 已确认且与 `~/.gemini/config/config.json` 中 `sidecars.chatgpt-bridge.projectId` 一致（标准 `--agy-conversation-id` 安装默认不写入 `projectId`）。创建期间原 `"confirmed"` 路由保持收件不中断，可通过 `action="get"` 的 `route.open_attempt` 查看进度（`"opening"` / `"creating"`）或失败原因（`"blocked"` 与 `error_code`），仅在新会话通过目录与项目核验后切换。
+- **Antigravity → Codex（`bridge_bind_session`）**：
+  1. 调用 `bridge_bind_session(workspace_path="C:/path/to/workspace", reuse_workspace_binding=true)` 可按规范化真实路径复用已有的无头 `codex_exec` 会话绑定。
+  2. 可选传入 `ensure_codex_project=true`，通过实验版 Codex App Server 复用或创建桌面侧边栏项目（绑定时返回 `project` 状态，首轮完成后在运行记录中写入 `project_attachment`）；若实验接口不可用，无头任务仍正常在 `workspace_path` 内执行。
+  3. 无头派发可在 `bridge_dispatch_task` 中传 `wait_for_result=false` 立即返回 `dispatch_id`，随后用 `bridge_dispatch_status(dispatch_id="<dispatch_id>")` 按编号取回该轮结果。
 
-原配对会继续接收请求，直到新会话通过核验。创建期间可通过 `action="get"` 的 `route.open_attempt` 查看进度或失败原因。
+### 会话模型控制与核验
 
-在 Antigravity 中调用 `bridge_bind_session`，传入同一目录和 `reuse_workspace_binding=true`，即可复用对应的 Codex 绑定。需要桌面项目时可传 `ensure_codex_project=true`，由实验版 Codex App Server 创建或复用，并在首轮结束后核对会话挂接状态。无头任务可用 `wait_for_result=false` 立即取得派发编号，再用 `bridge_dispatch_status` 读取该任务的结果。
+| 目标场景 | 可用操作 | 生效范围与能力边界 |
+| :--- | :--- | :--- |
+| **Codex 无头绑定（`codex_exec`）** | `bridge_codex_session_model(binding_id, action="get" \| "set", model="<slug>")`（或绑定时传 `codex_model`） | 作用于该绑定的**下一轮无头执行**（`codex.exe exec` / `exec resume`），续接同一会话时保留上下文，并返回 `next_model`、`last_dispatched_model` 与 `last_observed_model`。**无法**改变正在运行中的轮次。 |
+| **Codex 桌面窗口（`uia`）** | 本桥接工具不支持（返回 `CODEX_DESKTOP_MODEL_NOT_SUPPORTED`） | 无法通过本桥接工具远程修改 ChatGPT / Codex 桌面窗口的模型选择器。*（Codex 原生 CLI / App Server 自身的会话接口属于宿主独立能力，独立于本仓库桌面 UIA 模式。）* |
+| **Antigravity 已有会话** | 通过会话内置的 Swarm 切换模型，再通过 `agy_submit_for_review` 要求使用该模型 | 保留原会话 ID 与上下文。宿主钩子在领取和回执时都核验会话与实际模型。请求因模型不符而阻塞时，可用指定模型恢复，也可从 Codex 取消。 |
+| **Antigravity 新建会话** | 宿主原生 `agentapi new-conversation --model=<model_id>` | 本机已用 `gemini-4-neon-medium` 验证。目标模型不可用时宿主会回退至 `flash` 档。桥接工具 `agy_workspace_pair(action="open")` 没有 `model` 参数。 |
 
-### 指定模型
+#### 切换 Antigravity 已有会话的模型
 
-- **Antigravity** 的请求可以通过 `agy_submit_for_review` 提交 `required_model` 和已确认的 `target_conversation_id`。领取和回执时由宿主钩子核验会话与模型。可按请求编号查看入队、通知、领取、阻塞及回执状态。尚未领取或领取后因模型校验阻塞的请求可以用 `agy_cancel_guarded_review` 取消。阻塞的会话也可用指定模型恢复处理。现有桌面 Sidecar 可以发消息，也支持在新建会话时提交模型偏好。既有会话的切换没有原生命令。正文里的模型偏好不会触发核验。[Sidecar 接口](https://antigravity.google/docs/sidecars#agentapi) · [生命周期钩子](https://antigravity.google/docs/hooks#pretooluse)
-- **Codex** 的下一轮无头模型可以通过 `bridge_codex_session_model` 查询或设置。结果同时提供已保存的下一轮模型和上一轮可用的宿主证据。已在运行的轮次和桌面选择器使用各自的模型配置。
+1. 用 `agy_workspace_pair(action="get")` 确认工作区已配对到目标会话，并启用 Sidecar 通知。用户明确要求切换时，通过 `agy_submit_for_review` 发送一条普通请求。把目标会话 ID 和准确模型 ID 写在正文里，省略 `required_model` 和 `target_conversation_id` 参数，让当前模型先执行切换。
+2. 在目标会话中调用 `swarm(action="status")`。如果尚无 Swarm，用 `swarm(action="title", title="Model selection")` 初始化看板和协调者。确认当前会话是协调者后，调用 `swarm(action="model", name="coordinator", model="gemini-4-neon-medium")`。操作在原会话内进行，无需添加成员。按原请求编号回告工具结果。
+3. 收到切模回执后，向同一会话另发一条要求使用准确模型的请求。检查回执中的 `execution_model` 与 `reply_model`，核验实际模型。隔离桌面会话已实测从 Hydrogen High 切到 Neon Medium，随后一条独立的 Sidecar 请求实际运行在 Neon Medium。
+
+#### 为任务指定模型
+
+在 Codex 中调用 `agy_submit_for_review` 并传入以下参数。指定模型的请求会立即返回 `request_id`。
+
+```json
+{
+  "workspace_path": "C:/path/to/workspace",
+  "target_conversation_id": "<confirmed_conversation_id>",
+  "required_model": "gemini-4-neon-medium",
+  "step_summary": "核对状态流转边界。"
+}
+```
+
+在目标 Antigravity 会话中，用同一个 `request_id` 调用 `bridge_claim_codex_request` 领取，再用 `bridge_reply_to_codex` 回执。宿主钩子会自动提供模型校验凭证。
+
+在 Codex 中用同一编号调用 `agy_fetch_director_reply`，查看 `delivery.status` 或读取回执。请求尚未领取或因模型校验阻塞时，可以调用 `agy_cancel_guarded_review` 取消。
+
+在 Antigravity 中调用 `bridge_codex_session_model`，设置该绑定下一轮无头执行所用的模型。
+
+```json
+{
+  "binding_id": "<binding_id>",
+  "action": "set",
+  "model": "gpt-6.2-astra"
+}
+```
+
+[Antigravity Sidecar 接口（`agentapi`）](https://antigravity.google/docs/sidecars#agentapi) · [Antigravity Swarm](https://antigravity.google/docs/swarm/) · [Antigravity 生命周期钩子（`PreToolUse` / `PreInvocation`）](https://antigravity.google/docs/hooks#pretooluse)
 
 ---
 

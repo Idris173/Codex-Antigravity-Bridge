@@ -50,6 +50,12 @@ description: >-
 - 用 `agy_workspace_pair(action="link")` 按已有 Antigravity 会话 ID 配对实际目录，等 `get` 确认后复用。用户要求在已配对项目中开新会话时用 `open`，并在同一工作区核对结果。缺少项目或目录验证时告诉用户具体原因。
 - 用户指定必须使用的 Antigravity 模型时，将 `required_model` 和已确认的 `target_conversation_id` 作为工具参数。路由偏好不代表实际执行。只有宿主确认后任务正文才可领取。发现模型不符时保留等待状态并汇报，用户要求取消时调用 `agy_cancel_guarded_review`。
 
+### 切换 Antigravity 已有桌面会话的模型
+
+1. 用户明确要求切换会话模型时，用 `agy_workspace_pair(action="get")` 确认工作区路由指向用户指定的会话。用 `agy_submit_for_review` 发送一条普通切模请求，在正文写明目标会话 ID、准确模型 ID 及用户授权。该请求只做切模，省略 `required_model` 和 `target_conversation_id` 工具参数，让当前模型能先调用宿主工具。
+2. 目标会话用内置 `swarm(action="status")` 检查协调者。普通会话尚无 Swarm 时，用 `swarm(action="title", title="Model selection")` 初始化当前会话的协调者记录，再用 `swarm(action="model", name="coordinator", model=...)` 自切。已有协调者时复用。该流程会为首次切换的会话创建 Swarm 看板，无需添加成员。
+3. 用 `agy_fetch_director_reply` 等待切模回执。成功后再向同一会话发送带 `required_model` 和 `target_conversation_id` 的任务或只读验证。用回执的 `execution_model` 和 `reply_model` 确认实际模型。切换失败或宿主仍报告不符时，保留任务的模型要求并汇报实际原因。
+
 ---
 
 ## 5. Language Matching & Mandatory Response Format (语言自适应与强制四段式协议)

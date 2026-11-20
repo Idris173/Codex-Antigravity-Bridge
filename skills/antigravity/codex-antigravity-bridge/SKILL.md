@@ -56,6 +56,12 @@ description: >-
 - Codex 侧已注册反向 MCP 服务 `antigravity_bridge`，可通过 `agy_submit_for_review` 向本地共享总线投递待审代码或请示。
 - 调用 `bridge_check_codex_inbox` 获取待审摘要，可传 `workspace_path` 按工程筛选。审查后将该单 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。有多张待审单时必须指定编号。
 - 要求特定 Antigravity 模型的请求通过 `bridge_claim_codex_request` 领取。该工具依赖宿主检查会话 ID 和调用模型。工具报告未核验或不符时停止，不取用任务正文或回执。通过检查再处理，并按同一编号回执。
+
+### 接收已有桌面会话的切模请求
+
+1. 通过 `bridge_check_codex_inbox` 读取普通切模请求。核对用户明确授权、当前会话 ID 与请求目标，以及准确模型 ID。必要时用内置 `swarm(action="models", all=true)` 检查模型可用性。遇到目标不符或模型不可用时按原编号回告原因。
+2. 用 `swarm(action="status")` 检查当前会话。尚无 Swarm 时，用 `swarm(action="title", title="Model selection")` 创建看板并初始化当前会话的协调者，无需调用 `add`。已有 Swarm 时，只有确认当前会话是该协调者才能继续。使用 `swarm(action="model", name="coordinator", model=...)` 切换自身，按原 `request_id` 用 `bridge_reply_to_codex` 回告工具的实际结果。
+3. 切模回执只记录工具结果。等 Codex 发来单独的指定模型任务，再经 `bridge_claim_codex_request` 由宿主检查实际模型。
 - 用 `bridge_server.py cli wait_inbox --timeout 600 --only-new` 等待监听开始后的新提交。脚本位于 `~/.gemini/config/sidecars/chatgpt-bridge/bridge_server.py`。
 
 ---

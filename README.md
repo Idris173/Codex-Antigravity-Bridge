@@ -173,24 +173,66 @@ By default, inbox checks are on-demand or polled via `cli wait_inbox`. If you wa
    ```
 
 2. **Requirements & Behavior**:
-   - Configures `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json` and enables `sidecars.chatgpt-bridge` in `~/.gemini/config/config.json`.
-   - Uses Antigravity's sidecar `agentapi send-message` (requires `agentapi` to be available on the Antigravity sidecar `PATH`) to notify `<conversation-id>` when a new eligible `request_id` arrives for that workspace.
-   - The notified Antigravity conversation reads the submission via `bridge_check_codex_inbox` and replies with `bridge_reply_to_codex` under its existing permissions.
-   - Restart Antigravity if the sidecar does not start immediately after the configuration change.
+   - Configures `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json`, enables `sidecars.chatgpt-bridge` in `~/.gemini/config/config.json`, and registers the `codex-antigravity-bridge-model` lifecycle hook in `~/.gemini/config/hooks.json` (`--doctor` verifies this hook when the sidecar is present).
+   - Uses Antigravity's sidecar `agentapi send-message` (requires `agentapi` on the Antigravity sidecar `PATH`) to notify `<conversation-id>` when a new eligible `request_id` arrives for that workspace.
+   - Use `bridge_check_codex_inbox` to read ordinary requests and `bridge_claim_codex_request` to claim requests that require a model. Reply to either through `bridge_reply_to_codex` under the conversation's existing permissions.
+   - Restart Antigravity if the sidecar or hook does not load immediately after the configuration change.
    - To pause automatic notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.
 
-### Pair a workspace
+### Pair a Workspace
 
-From Codex, use `agy_workspace_pair` with `action="link"`, the existing folder's absolute path, and the Antigravity conversation ID. Check `action="get"` until native metadata confirms that Antigravity has that folder. Multiple confirmed folders can route to their own conversations. Add the folder as an Antigravity project in the app if it has no matching project yet. To open another Antigravity chat through `action="open"`, its confirmed project must match the Sidecar's configured `projectId`.
+- **Codex → Antigravity (`agy_workspace_pair`)**:
+  1. Ensure the target folder is open as a workspace/project in Antigravity, then call `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", conversation_id="<conversation_id>")`.
+  2. Poll `agy_workspace_pair(action="get", workspace_path="C:/path/to/workspace")` until `route.status` is `"confirmed"` via native `agentapi get-conversation-metadata`. Multiple confirmed folders can route to separate Antigravity conversations.
+  3. Calling `action="open"` attempts to create a new paired Antigravity conversation only when `route.project_id` is confirmed and matches `sidecars.chatgpt-bridge.projectId` in `~/.gemini/config/config.json` (not set by default during standard `--agy-conversation-id` install). The existing `"confirmed"` route continues receiving requests while `route.open_attempt` reports `"opening"`, `"creating"`, or `"blocked"` (`error_code`), and switches only after the new conversation's workspace metadata is verified.
+- **Antigravity → Codex (`bridge_bind_session`)**:
+  1. Call `bridge_bind_session(workspace_path="C:/path/to/workspace", reuse_workspace_binding=true)` to reuse an active headless `codex_exec` binding for the same resolved folder.
+  2. Optionally pass `ensure_codex_project=true` to reuse or create a sidebar project via the experimental Codex App Server (`project` status on bind, `project_attachment` on the completed run). If the experimental API is unavailable, headless execution still runs in `workspace_path`.
+  3. For non-blocking headless turns, pass `wait_for_result=false` to `bridge_dispatch_task` and read the exact turn outcome via `bridge_dispatch_status(dispatch_id="<dispatch_id>")`.
 
-The confirmed route stays in use until the new conversation is verified. While opening, check `route.open_attempt` with `action="get"` for progress or a failure reason.
+### Session Model Control
 
-From Antigravity, use `bridge_bind_session` with the same path and `reuse_workspace_binding=true` to reuse a matching Codex binding. If requested, pass `ensure_codex_project=true` to create or reuse a desktop project through the experimental Codex App Server. Check the reported desktop project status and the thread attachment after the first turn. Use `wait_for_result=false` for headless dispatches and retrieve the exact result by `dispatch_id` with `bridge_dispatch_status`.
+| Target | Available Controls | Scope & Boundaries |
+| :--- | :--- | :--- |
+| **Codex headless binding (`codex_exec`)** | `bridge_codex_session_model(binding_id, action="get" \| "set", model="<slug>")` (or initial `codex_model` on `bridge_bind_session`) | Applies to the **next headless turn** (`codex.exe exec` / `exec resume`), preserving session history across model changes and reporting `next_model`, `last_dispatched_model`, and `last_observed_model`. Does **not** alter a turn already in progress. |
+| **Codex desktop window (`uia`)** | Not supported via bridge (`CODEX_DESKTOP_MODEL_NOT_SUPPORTED`) | The bridge cannot remotely change the ChatGPT/Codex desktop app's model picker. *(Host-native Codex CLI / App Server session APIs exist independently of this bridge's desktop UIA mode.)* |
+| **Antigravity existing conversation** | Request a model switch through the conversation's built-in Swarm tool, then require the model through `agy_submit_for_review` | The conversation keeps its ID and context. The host hook checks the conversation and actual model at both claim and reply. Use the required model to resume a blocked request or cancel it from Codex. |
+| **Antigravity new conversation** | Host-native `agentapi new-conversation --model=<model_id>` | Tested locally with `gemini-4-neon-medium`. The host falls back to the `flash` tier if the requested model is unavailable. The bridge's `agy_workspace_pair(action="open")` has no `model` parameter. |
 
-### Require a model
+#### Switch the model of an existing Antigravity conversation
 
-- **Antigravity**. Pass `required_model` and the confirmed `target_conversation_id` to `agy_submit_for_review`. The Antigravity host hook checks the conversation and model when it claims the task and when it replies. Use the reply lookup to check whether the request was queued, notified, claimed, blocked, or replied to. Use `agy_cancel_guarded_review` before the request is claimed or if model verification blocks it after claim. A blocked conversation can also resume with the required model. The desktop Sidecar supports sending messages and can request a model when opening a fresh session. It provides no command to change an existing session's model. A model preference in a message does not enforce a model requirement. [Sidecars](https://antigravity.google/docs/sidecars#agentapi) · [Lifecycle hooks](https://antigravity.google/docs/hooks#pretooluse)
-- **Codex**. Use `bridge_codex_session_model` to get or set the model for the next headless turn of a binding. The tool reports the saved next model and any model evidence from the last run. The current running turn and the desktop model picker have their own selection.
+1. Confirm that `agy_workspace_pair(action="get")` shows a confirmed route to the target conversation and that Sidecar notifications are active. Once the user requests a switch, send an ordinary `agy_submit_for_review` request. Put the target conversation ID and exact model ID in the message and omit the `required_model` and `target_conversation_id` arguments so the current model can perform the switch.
+2. In the target conversation, check `swarm(action="status")`. If it has no Swarm, call `swarm(action="title", title="Model selection")` to initialize its board and coordinator. Once the conversation is confirmed as the coordinator, call `swarm(action="model", name="coordinator", model="gemini-4-neon-medium")`. This uses the original conversation and needs no worker agents. Reply with the tool result using the same request ID.
+3. After the switch reply arrives, send a separate request that requires the exact model and the same conversation ID. Check `execution_model` and `reply_model` in the reply to verify the actual model. An isolated desktop conversation was tested switching from Hydrogen High to Neon Medium, and a separate Sidecar-triggered turn ran on Neon Medium.
+
+#### Require a model for a request
+
+From Codex, call `agy_submit_for_review` with these arguments. A request that requires a model immediately returns a `request_id`.
+
+```json
+{
+  "workspace_path": "C:/path/to/workspace",
+  "target_conversation_id": "<confirmed_conversation_id>",
+  "required_model": "gemini-4-neon-medium",
+  "step_summary": "Verify edge-case state transitions."
+}
+```
+
+In the target Antigravity conversation, use `bridge_claim_codex_request` and then `bridge_reply_to_codex` with the same `request_id`. The host hook supplies the model proof automatically.
+
+From Codex, use `agy_fetch_director_reply` with that ID to check `delivery.status` or read the reply. You can call `agy_cancel_guarded_review` before the request is claimed or while model verification blocks it.
+
+From Antigravity, call `bridge_codex_session_model` to set the next headless turn's model.
+
+```json
+{
+  "binding_id": "<binding_id>",
+  "action": "set",
+  "model": "gpt-6.2-astra"
+}
+```
+
+[Antigravity Sidecars (`agentapi`)](https://antigravity.google/docs/sidecars#agentapi) · [Antigravity Swarm](https://antigravity.google/docs/swarm/) · [Antigravity Lifecycle Hooks (`PreToolUse` / `PreInvocation`)](https://antigravity.google/docs/hooks#pretooluse)
 
 ---
 
