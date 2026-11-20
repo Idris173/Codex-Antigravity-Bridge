@@ -49,6 +49,7 @@ BUS_DIR = BASE_DIR / "bus"
 TO_AGY_FILE = BUS_DIR / "to_antigravity.json"
 LATEST_TO_CODEX_FILE = BUS_DIR / "to_codex_latest.json"
 REQUEST_ID = re.compile(r"req_[0-9]+_[0-9a-f]{6,32}")
+DISPATCH_ID = re.compile(r"[0-9a-f]{32}")
 
 _WARM_PS_PROC: Optional[subprocess.Popen] = None
 _WARM_PS_LOCK = threading.Lock()
@@ -580,6 +581,8 @@ def build_director_envelope(
     dispatch_id: str = "",
     lang: str = "",
     routing_tag: str = "",
+    repository_read_only: bool = False,
+    authorize_receipt: bool = False,
 ) -> str:
     eng_norm = (engine or "UNREAL").strip().upper()
     if eng_norm not in ("UNREAL", "THREEJS", "GENERAL"):
@@ -592,7 +595,21 @@ def build_director_envelope(
         else "Respond strictly in English for all prose inside sections."
     )
 
-    lines = ["[DIRECTOR_TASK]"]
+    lines = []
+    if authorize_receipt:
+        lines.append(
+            "$stop-that-shit change -- Authorize only one agy_submit_dispatch_receipt call for this dispatch. "
+            "The repository remains sandboxed read-only. This does not authorize other changes."
+        )
+    lines.append("[DIRECTOR_TASK]")
+    if repository_read_only:
+        lines.append("[REPOSITORY_ACCESS: read-only]")
+    if authorize_receipt:
+        lines.append(
+            "[RECEIPT_AUTHORIZATION: once]\n"
+            "After completing the task, call agy_submit_dispatch_receipt with your result. "
+            "The MCP server binds it to this dispatch. Use the returned request_id in your final summary."
+        )
     routing = routing_tag.strip() or _routing_tag()
     if routing:
         lines.append(routing if routing.startswith("[ROUTING:") else f"[ROUTING: {routing}]")
@@ -848,6 +865,12 @@ def tool_bind_session(
     }
 
 
+def _is_headless_binding(lock: Dict[str, Any]) -> bool:
+    return lock.get("transport") == "codex_exec" or (
+        int(lock.get("hwnd", 0)) == 0 and bool(lock.get("workspace_path") or lock.get("codex_session_id"))
+    )
+
+
 def tool_dispatch_task(
     step_goal: str,
     task_instruction: str,
@@ -857,11 +880,19 @@ def tool_dispatch_task(
     timeout_sec: int = 50,
     binding_id: str = "",
     routing_tag: str = "",
+    repository_read_only: bool = False,
+    authorize_receipt: bool = False,
 ) -> Dict[str, Any]:
     store = _binding_store()
     lock, err = store.get_binding(binding_id)
     if err is not None or lock is None:
         return err or {"ok": False, "error_code": "SESSION_NOT_BOUND", "message": "未绑定任何会话。"}
+
+    use_headless = _is_headless_binding(lock)
+    if authorize_receipt and not repository_read_only:
+        return {"ok": False, "error_code": "RECEIPT_REQUIRES_READ_ONLY"}
+    if repository_read_only and (not use_headless or not lock.get("workspace_path")):
+        return {"ok": False, "error_code": "READ_ONLY_REQUIRES_HEADLESS_WORKSPACE"}
 
     if is_rework:
         next_retry = int(lock.get("retry_count", 0)) + 1
@@ -881,6 +912,15 @@ def tool_dispatch_task(
         retry_val = 0
 
     dispatch_id = uuid.uuid4().hex
+    _atomic_write_json(_dispatch_path(dispatch_id), {
+        "dispatch_id": dispatch_id,
+        "binding_id": lock["binding_id"],
+        "workspace_path": lock.get("workspace_path", ""),
+        "dispatched_at": _now_iso(),
+        "request_id": f"req_{int(time.time() * 1000)}_{dispatch_id}",
+        "repository_read_only": repository_read_only,
+        "receipt_authorized": authorize_receipt,
+    })
     updated = store.update_binding(str(lock["binding_id"]), retry_count=retry_val, last_dispatch_id=dispatch_id)
     if isinstance(updated, dict):
         lock = updated
@@ -894,24 +934,23 @@ def tool_dispatch_task(
         rework_round=int(lock.get("retry_count", 0)),
         dispatch_id=dispatch_id,
         routing_tag=routing_tag,
+        repository_read_only=repository_read_only,
+        authorize_receipt=authorize_receipt,
     )
 
     # Cap synchronous MCP wait at 55s by default so host ~70s MCP call timeout never cancels long turns
     safe_sync_timeout = max(5, min(int(timeout_sec), 55))
 
-    use_headless = (
-        lock.get("transport") == "codex_exec"
-        or (int(lock.get("hwnd", 0)) == 0 and bool(lock.get("workspace_path") or lock.get("codex_session_id")))
-    )
     if use_headless:
         driver_res = _headless_runner().dispatch(
             lock,
             dispatch_id=dispatch_id,
             envelope=envelope,
             timeout_sec=safe_sync_timeout,
+            repository_read_only=repository_read_only,
+            authorize_receipt=authorize_receipt,
+            on_complete=lambda result: _record_execution(dispatch_id, result),
         )
-        if not driver_res.get("ok") and not driver_res.get("timed_out"):
-            return {**driver_res, "binding_id": lock["binding_id"], "dispatch_id": dispatch_id}
         if driver_res.get("codex_session_id"):
             lock["codex_session_id"] = driver_res["codex_session_id"]
     else:
@@ -925,9 +964,14 @@ def tool_dispatch_task(
             timeout_sec=safe_sync_timeout,
             allow_placeholder_title=lock.get("awaiting_first_title", _is_placeholder_title(lock["session_title"])),
         )
-        if not driver_res.get("ok") and not driver_res.get("timed_out"):
-            return {**driver_res, "binding_id": lock["binding_id"], "dispatch_id": dispatch_id}
-        lock = _update_first_title(lock, driver_res)
+        if driver_res.get("ok") or driver_res.get("timed_out"):
+            lock = _update_first_title(lock, driver_res)
+
+    if not use_headless or (not driver_res.get("timed_out") and not _execution_path(dispatch_id).exists()):
+        _record_execution(dispatch_id, driver_res)
+    lifecycle = tool_dispatch_status(dispatch_id)
+    if not driver_res.get("ok") and not driver_res.get("timed_out"):
+        return {**driver_res, "binding_id": lock["binding_id"], "dispatch_id": dispatch_id, "lifecycle": lifecycle}
 
     timed_out = bool(driver_res.get("timed_out"))
     raw_reply = str(driver_res.get("raw_reply", ""))
@@ -947,6 +991,7 @@ def tool_dispatch_task(
         "binding_id": lock["binding_id"],
         "codex_session_id": driver_res.get("codex_session_id", lock.get("codex_session_id", "")),
         "dispatch_id": dispatch_id,
+        "lifecycle": lifecycle,
         "turn_id": driver_res.get("turn_id", ""),
         "channel": driver_res.get("channel", "uia"),
         "telemetry": telemetry,
@@ -971,19 +1016,16 @@ def tool_read_latest(binding_id: str = "") -> Dict[str, Any]:
             "message": "当前未绑定会话，若仅探测状态请调用 bridge_inspect_app。",
         }
 
-    use_headless = (
-        lock.get("transport") == "codex_exec"
-        or (int(lock.get("hwnd", 0)) == 0 and bool(lock.get("workspace_path") or lock.get("codex_session_id")))
-    )
-    if use_headless:
+    if _is_headless_binding(lock):
         run_state = _headless_runner().read_latest_run(str(lock["binding_id"])) or {}
         last_msg = str(run_state.get("raw_reply") or "")
-        is_running = run_state.get("status") == "running_async"
+        is_running = run_state.get("status") in ("running", "running_async")
         return {
             "ok": True,
             "binding_id": lock["binding_id"],
             "channel": "codex_headless_exec",
             "status": run_state.get("status", "idle"),
+            "dispatch_id": run_state.get("dispatch_id", ""),
             "codex_session_id": run_state.get("codex_session_id", lock.get("codex_session_id", "")),
             "snapshot": {
                 "active_session": lock["session_title"],
@@ -1025,6 +1067,65 @@ def tool_unbind_session(binding_id: str = "") -> Dict[str, Any]:
 # Concurrent-Safe Multi-Request Inbox Bus (16+ parallel requests safe)
 # ---------------------------------------------------------------------------
 
+def _dispatch_path(dispatch_id: str) -> Path:
+    return BUS_DIR / "dispatches" / f"{dispatch_id}.json"
+
+
+def _execution_path(dispatch_id: str) -> Path:
+    return _dispatch_path(dispatch_id).with_suffix(".execution.json")
+
+
+def _load_dispatch(dispatch_id: str) -> Optional[Dict[str, Any]]:
+    return _read_json_safe(_dispatch_path(dispatch_id)) if DISPATCH_ID.fullmatch(dispatch_id) else None
+
+
+def _request_path(request_id: str) -> Path:
+    return BUS_DIR / "requests" / f"{request_id}.json"
+
+
+def _record_execution(dispatch_id: str, result: Dict[str, Any]) -> None:
+    if result.get("timed_out") or result.get("error_code") == "DAEMON_EXEC_UNCERTAIN":
+        status = "unconfirmed"
+    else:
+        status = "completed" if result.get("ok") else "failed"
+    record = {"status": status, "observed_at": _now_iso()}
+    if status in ("completed", "failed"):
+        record["completed_at"] = result.get("completed_at") or record["observed_at"]
+    for field in ("codex_session_id", "turn_id", "error_code"):
+        if result.get(field):
+            record[field] = result[field]
+    _atomic_write_json(_execution_path(dispatch_id), record)
+
+
+def tool_dispatch_status(dispatch_id: str) -> Dict[str, Any]:
+    dispatch = _load_dispatch(dispatch_id)
+    if not dispatch:
+        return {"ok": False, "error_code": "UNKNOWN_DISPATCH_ID", "dispatch_id": dispatch_id}
+
+    request_id = dispatch["request_id"]
+    request = _read_json_safe(_request_path(request_id))
+    reply = _read_json_safe(_reply_path(request_id)) if request else None
+    receipt: Dict[str, Any] = {"status": "awaiting"}
+    if request:
+        receipt = {
+            "status": "acknowledged" if reply else "queued",
+            "request_id": request_id,
+            "queued_at": request["submitted_at"],
+        }
+        if reply:
+            receipt["acknowledged_at"] = reply["replied_at"]
+            receipt["decision"] = reply["decision"]
+    elif dispatch["repository_read_only"] and not dispatch["receipt_authorized"]:
+        receipt["status"] = "not_authorized"
+
+    return {
+        "ok": True,
+        **dispatch,
+        "execution": _read_json_safe(_execution_path(dispatch_id)) or {"status": "awaiting_completion"},
+        "receipt": receipt,
+    }
+
+
 def _reply_path(request_id: str) -> Path:
     return BUS_DIR / f"to_codex_{request_id}.json"
 
@@ -1058,7 +1159,7 @@ def tool_check_codex_inbox(request_id: str = "", workspace_path: str = "") -> Di
         "oldest_pending": pending[0] if pending else None,
         "latest_pending": pending[-1] if pending else None,
         "pending_summaries": [
-            {key: item.get(key, "") for key in ("request_id", "submitted_at", "workspace_path", "step_summary")}
+            {key: item.get(key, "") for key in ("request_id", "dispatch_id", "submitted_at", "workspace_path", "step_summary")}
             for item in pending
         ],
         "pending_request_ids": [item["request_id"] for item in pending],
@@ -1112,10 +1213,13 @@ def tool_reply_to_codex(
             "replied_at": _now_iso(),
             **fields,
         }
+        request = next(item for item in pending if item["request_id"] == req_id)
+        if request.get("dispatch_id"):
+            reply_payload["dispatch_id"] = request["dispatch_id"]
         _atomic_write_json(path, reply_payload)
         _atomic_write_json(LATEST_TO_CODEX_FILE, reply_payload)
 
-        req_file = BUS_DIR / "requests" / f"{req_id}.json"
+        req_file = _request_path(req_id)
         req_doc = _read_json_safe(req_file)
         if isinstance(req_doc, dict):
             req_doc["status"] = "replied"
@@ -1133,6 +1237,50 @@ def tool_reply_to_codex(
 # Codex-Side Tool Implementations (Worker Role: ZERO computer-use needed!)
 # ---------------------------------------------------------------------------
 
+def _queue_dispatch_receipt(dispatch: Dict[str, Any], submission: Dict[str, Any]) -> Dict[str, Any]:
+    request_id = dispatch["request_id"]
+    path = _request_path(request_id)
+    submission = {
+        **submission,
+        "request_id": request_id,
+        "dispatch_id": dispatch["dispatch_id"],
+        "workspace_path": dispatch["workspace_path"] or submission["workspace_path"],
+    }
+    with _mutex(BUS_DIR / "replies.mutex"):
+        existing = _read_json_safe(path)
+        if existing:
+            fields = ("step_summary", "self_check", "open_questions", "changed_files", "code_or_diff")
+            if any(existing.get(field) != submission.get(field) for field in fields):
+                return {"ok": False, "error_code": "RECEIPT_ALREADY_SUBMITTED", "request_id": request_id}
+        else:
+            _atomic_write_json(path, submission)
+    return {
+        "ok": True,
+        "dispatch_id": dispatch["dispatch_id"],
+        "request_id": request_id,
+        "status": "queued",
+        "already_queued": bool(existing),
+    }
+
+
+def codex_tool_submit_dispatch_receipt(scope: str, step_summary: str, self_check: str = "") -> Dict[str, Any]:
+    dispatch = _load_dispatch(scope)
+    if not dispatch or not dispatch.get("receipt_authorized"):
+        return {"ok": False, "error_code": "RECEIPT_NOT_AUTHORIZED"}
+    if not step_summary.strip():
+        return {"ok": False, "error_code": "EMPTY_RECEIPT"}
+    return _queue_dispatch_receipt(dispatch, {
+        "status": "pending",
+        "submitted_at": _now_iso(),
+        "workspace_path": dispatch["workspace_path"],
+        "step_summary": step_summary,
+        "changed_files": "",
+        "code_or_diff": "",
+        "self_check": self_check,
+        "open_questions": "NONE",
+    })
+
+
 def codex_tool_submit_for_review(
     step_summary: str,
     changed_files: str = "",
@@ -1142,8 +1290,19 @@ def codex_tool_submit_for_review(
     workspace_path: str = "",
     wait_for_reply: bool = True,
     wait_timeout_sec: int = 240,
+    dispatch_id: str = "",
 ) -> Dict[str, Any]:
-    req_id = f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
+    dispatch = _load_dispatch(dispatch_id) if dispatch_id else None
+    if dispatch_id and not dispatch:
+        return {"ok": False, "error_code": "UNKNOWN_DISPATCH_ID", "dispatch_id": dispatch_id}
+    if dispatch and dispatch["repository_read_only"]:
+        return {"ok": False, "error_code": "SCOPED_RECEIPT_REQUIRED", "dispatch_id": dispatch_id}
+    if dispatch and workspace_path and dispatch["workspace_path"] and not filter_submissions_by_workspace(
+        [dispatch], workspace_path,
+    ):
+        return {"ok": False, "error_code": "DISPATCH_WORKSPACE_MISMATCH", "dispatch_id": dispatch_id}
+
+    req_id = dispatch["request_id"] if dispatch else f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
     submission = {
         "request_id": req_id,
         "status": "pending",
@@ -1155,16 +1314,21 @@ def codex_tool_submit_for_review(
         "self_check": self_check,
         "open_questions": open_questions,
     }
-    _ensure_bus_dir()
-    _atomic_write_json(BUS_DIR / "requests" / f"{req_id}.json", submission)
-
-    if not wait_for_reply:
-        return {
+    if dispatch:
+        queued = _queue_dispatch_receipt(dispatch, submission)
+        if not queued["ok"]:
+            return queued
+    else:
+        _atomic_write_json(_request_path(req_id), submission)
+        queued = {
             "ok": True,
             "request_id": req_id,
             "status": "queued",
             "message": "已投递至 Antigravity 技术总监收件箱（非阻塞模式）。稍后可调用 agy_fetch_director_reply 获取评审结论。",
         }
+
+    if not wait_for_reply:
+        return queued
 
     reply_file = _reply_path(req_id)
     deadline = time.monotonic() + max(5, min(int(wait_timeout_sec), 290))
@@ -1179,6 +1343,7 @@ def codex_tool_submit_for_review(
         "ok": True,
         "request_id": req_id,
         "status": "waiting_director",
+        **({"dispatch_id": dispatch_id} if dispatch else {}),
         "timed_out": True,
         "message": (
             f"请求已写入总线 (request_id={req_id})，等待 {wait_timeout_sec}s 暂未收到同步批复。"
@@ -1290,8 +1455,20 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "binding_id": {"type": "string"},
                 "is_rework": {"type": "boolean"},
                 "timeout_sec": {"type": "integer"},
+                "repository_read_only": {"type": "boolean", "description": "无头 Codex 使用 read-only 沙箱。"},
+                "authorize_receipt": {"type": "boolean", "description": "为这个只读任务授权写入一条 MCP 回执。"},
             },
             "required": ["step_goal", "task_instruction"],
+        },
+    },
+    {
+        "name": "bridge_dispatch_status",
+        "description": "按派发 ID 核对执行、回执入箱和 Antigravity 批复确认状态。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"dispatch_id": {"type": "string"}},
+            "required": ["dispatch_id"],
+            "additionalProperties": False,
         },
     },
     {
@@ -1378,6 +1555,7 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "description": "是否阻塞等待 Antigravity 实时写回评审结论（默认 true）。",
                 },
+                "dispatch_id": {"type": "string", "description": "可选。对应普通派发的 DISPATCH_ID。"},
                 "wait_timeout_sec": {
                     "type": "integer",
                     "description": "等待批复超时秒数（默认 240 秒）。",
@@ -1388,6 +1566,7 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "agy_fetch_director_reply",
+        "annotations": {"readOnlyHint": True},
         "description": "查询 Antigravity 技术总监对指定 request_id 或最新一次提交的评审批复与下一步指令。",
         "annotations": {
             "title": "Fetch Antigravity Director Reply",
@@ -1444,7 +1623,41 @@ def _validate_args(tools: List[Dict[str, Any]], name: str, args: Dict[str, Any])
     return None
 
 
-def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+DISPATCH_RECEIPT_TOOL = {
+    "name": "agy_submit_dispatch_receipt",
+    "description": "向 Antigravity 写入当前只读派发的一条授权回执。工作区和派发 ID 由服务器绑定。",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"step_summary": {"type": "string"}, "self_check": {"type": "string"}},
+        "required": ["step_summary"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _scoped_codex_tools(scope: str) -> List[Dict[str, Any]]:
+    tools = [tool for tool in CODEX_MCP_TOOLS if tool["name"] == "agy_fetch_director_reply"]
+    dispatch = _load_dispatch(scope)
+    if dispatch and dispatch.get("receipt_authorized"):
+        tools.append(DISPATCH_RECEIPT_TOOL)
+    return tools
+
+
+def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope: str = "") -> Dict[str, Any]:
+    if role == "codex" and receipt_scope:
+        tools = _scoped_codex_tools(receipt_scope)
+        if name not in {tool["name"] for tool in tools}:
+            return {"ok": False, "error_code": "DISPATCH_SCOPE_FORBIDS_TOOL"}
+        arg_err = _validate_args(tools, name, args)
+        if arg_err:
+            return arg_err
+        if name == DISPATCH_RECEIPT_TOOL["name"]:
+            return codex_tool_submit_dispatch_receipt(receipt_scope, **args)
+        dispatch = _load_dispatch(receipt_scope)
+        if not dispatch or args.get("request_id", dispatch["request_id"]) != dispatch["request_id"]:
+            return {"ok": False, "error_code": "DISPATCH_SCOPE_MISMATCH"}
+        return codex_tool_fetch_director_reply(dispatch["request_id"])
+
     tools = CODEX_MCP_TOOLS if role == "codex" else AGY_MCP_TOOLS
     arg_err = _validate_args(tools, name, args)
     if arg_err is not None:
@@ -1464,6 +1677,7 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
                 workspace_path=args.get("workspace_path", ""),
                 wait_for_reply=bool(args.get("wait_for_reply", True)),
                 wait_timeout_sec=int(args.get("wait_timeout_sec", 240)),
+                dispatch_id=args.get("dispatch_id", ""),
             )
         if name == "agy_fetch_director_reply":
             return codex_tool_fetch_director_reply(request_id=args.get("request_id", ""))
@@ -1500,7 +1714,11 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
             timeout_sec=int(args.get("timeout_sec", 50)),
             binding_id=args.get("binding_id", ""),
             routing_tag=args.get("routing_tag", ""),
+            repository_read_only=bool(args.get("repository_read_only", False)),
+            authorize_receipt=bool(args.get("authorize_receipt", False)),
         )
+    if name == "bridge_dispatch_status":
+        return tool_dispatch_status(args["dispatch_id"])
     if name == "bridge_read_latest":
         return tool_read_latest(binding_id=args.get("binding_id", ""))
     if name == "bridge_create_project_session":
@@ -1558,7 +1776,10 @@ def _write_rpc_message(payload: Dict[str, Any], framing: str) -> None:
 
 def run_mcp_stdio_loop(role: str = "antigravity") -> None:
     server_name = "antigravity_bridge" if role == "codex" else "chatgpt-bridge"
+    receipt_scope = os.environ.get("CODEX_BRIDGE_RECEIPT_SCOPE", "") if role == "codex" else ""
     tools_list = CODEX_MCP_TOOLS if role == "codex" else AGY_MCP_TOOLS
+    if receipt_scope:
+        tools_list = _scoped_codex_tools(receipt_scope)
 
     while True:
         try:
@@ -1612,7 +1833,7 @@ def run_mcp_stdio_loop(role: str = "antigravity") -> None:
             t_name = params["name"]
             t_args = params.get("arguments", {})
             try:
-                result_obj = _dispatch_mcp_tool(role, t_name, t_args)
+                result_obj = _dispatch_mcp_tool(role, t_name, t_args, receipt_scope)
             except OSError:
                 result_obj = {"ok": False, "error_code": "IO_ERROR", "message": "本地桥接 I/O 操作失败。"}
             is_err = not bool(result_obj.get("ok", True))

@@ -21,7 +21,7 @@ python install.py --doctor
 
 Regardless of which AI agent invokes `install.py`, it performs the exact same non-destructive steps on the current user's Windows machine:
 
-1. **Deploys Shared Bidirectional Bridge Engine** to `~/.gemini/config/sidecars/chatgpt-bridge/` (`bridge_server.py`, `headless_multi_engine.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) and precompiles `BridgeFastUia.dll` using the local `.NET` toolchain.
+1. **Deploys Shared Bidirectional Bridge Engine** to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll` using the local `.NET` toolchain.
 2. **Installs the Antigravity skill** to `~/.gemini/config/skills/codex-antigravity-bridge/` (`SKILL.md` + Unreal Engine & Three.js review checklists).
 3. **Installs the Codex skill** to `~/.codex/skills/codex-antigravity-bridge/SKILL.md`.
 4. **Merges Both MCP Configurations Non-Destructively** (creating timestamped `.bak` backups before modifying existing files and preserving all existing MCP servers):
@@ -35,3 +35,7 @@ Regardless of which AI agent invokes `install.py`, it performs the exact same no
 1. Inform the user that both **Antigravity** (`codex-antigravity-bridge` + `chatgpt-bridge`) and **ChatGPT/Codex** (`codex-antigravity-bridge` + `antigravity_bridge`) are installed identically.
 2. Remind the user to **restart the ChatGPT Desktop App once** (if currently running) so Codex loads the newly registered `antigravity_bridge` MCP tools natively.
 3. Explain that both skills stay **dormant during normal chats** and only activate when the user explicitly asks Antigravity to direct a ChatGPT/Codex session (or asks Codex to submit work to Antigravity).
+
+## 4. Optional Antigravity conversation notifications
+
+From the workspace to connect, run `python <bridge-repo>/install.py --agy-conversation-id <conversation-id>`. This enables the Antigravity App sidecar for new Codex messages from that workspace and its subdirectories. It uses Antigravity's `agentapi send-message` to notify the selected conversation. The conversation reads the request and replies through MCP under its existing permissions. Restart Antigravity if the sidecar does not start after the configuration change. To pause notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.

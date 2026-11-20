@@ -356,6 +356,24 @@ class HeadlessMultiSessionMinimizedTests(unittest.TestCase):
         )
         self.assertIn("第二轮自动续接已有会话", logs["disp_turn_2"]["prompt"])
 
+    def test_read_only_scope_is_sent_on_new_and_resumed_codex_commands(self) -> None:
+        runner = HeadlessCodexRunner(self.base_dir, self.stub_codex)
+        approval = 'mcp_servers.antigravity_bridge.tools.agy_submit_dispatch_receipt.approval_mode="approve"'
+        for session_id in ("", "existing-session"):
+            with self.subTest(session_id=session_id):
+                options = {
+                    "model": "", "effort": "", "speed": "", "workspace_path": str(self.ws_a),
+                    "codex_session_id": session_id, "last_msg_file": self.base_dir / "last.txt",
+                    "read_only_dispatch_id": "a" * 32,
+                }
+                args = runner._build_command(self.stub_codex, **options)
+                self.assertEqual(args[args.index("-s") + 1], "read-only")
+                self.assertIn(f'mcp_servers.antigravity_bridge.env.CODEX_BRIDGE_RECEIPT_SCOPE="{"a" * 32}"', args)
+                self.assertNotIn(approval, args)
+                approved = runner._build_command(self.stub_codex, authorize_receipt=True, **options)
+                self.assertEqual(approved[approved.index("-s") + 1], "read-only")
+                self.assertIn(approval, approved)
+
     def test_async_timeout_background_continuation_and_read_latest_run(self) -> None:
         """Long turns exceeding `timeout_sec=1` return `running_async` without killing the child, then recover cleanly."""
         binding = self.store.create_binding(

@@ -22,7 +22,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 try:
     import msvcrt
@@ -684,6 +684,8 @@ class HeadlessCodexRunner:
         workspace_path: str,
         codex_session_id: str,
         last_msg_file: Path,
+        read_only_dispatch_id: str = "",
+        authorize_receipt: bool = False,
     ) -> List[str]:
         suffix = exe_path.suffix.lower()
         if suffix == ".py":
@@ -692,6 +694,16 @@ class HeadlessCodexRunner:
             prefix = [str(exe_path)]
 
         top_opts: List[str] = ["-c", 'approval_policy="never"']
+        sandbox = "read-only" if read_only_dispatch_id else "workspace-write"
+        if read_only_dispatch_id:
+            top_opts.extend([
+                "-c", f'mcp_servers.antigravity_bridge.env.CODEX_BRIDGE_RECEIPT_SCOPE="{read_only_dispatch_id}"',
+            ])
+            if authorize_receipt:
+                # Codex requires its own tool approval in addition to the bridge's one-receipt scope.
+                top_opts.extend([
+                    "-c", 'mcp_servers.antigravity_bridge.tools.agy_submit_dispatch_receipt.approval_mode="approve"',
+                ])
         if model:
             top_opts.extend(["-m", model])
         if effort:
@@ -702,7 +714,7 @@ class HeadlessCodexRunner:
 
         if codex_session_id:
             # Real codex.exe clap grammar accepts `-s` and `-C` on top-level/exec before `resume <SESSION_ID>`
-            top_opts.extend(["-s", "workspace-write"])
+            top_opts.extend(["-s", sandbox])
             if workspace_path:
                 top_opts.extend(["-C", workspace_path])
             sub_args = [
@@ -721,7 +733,7 @@ class HeadlessCodexRunner:
                 "--json",
                 "--skip-git-repo-check",
                 "-s",
-                "workspace-write",
+                sandbox,
             ]
             if workspace_path:
                 sub_args.extend(["-C", workspace_path])
@@ -735,6 +747,9 @@ class HeadlessCodexRunner:
         dispatch_id: str,
         envelope: str,
         timeout_sec: int = 50,
+        repository_read_only: bool = False,
+        authorize_receipt: bool = False,
+        on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         exe_path = self.discover_codex_exe()
         if exe_path is None:
@@ -781,6 +796,8 @@ class HeadlessCodexRunner:
             workspace_path=workspace_path,
             codex_session_id=codex_session_id,
             last_msg_file=last_msg_file,
+            read_only_dispatch_id=dispatch_id if repository_read_only else "",
+            authorize_receipt=authorize_receipt,
         )
 
         cwd_arg: Optional[str] = None
@@ -1054,6 +1071,11 @@ class HeadlessCodexRunner:
                     }
 
                 _atomic_write_json(last_run_path, final_doc)
+                if on_complete:
+                    try:
+                        on_complete(final_doc)
+                    except OSError as error:
+                        print(f"Could not persist dispatch outcome: {error}", file=sys.stderr)
                 with state_lock:
                     shared["final_doc"] = final_doc
             finally:

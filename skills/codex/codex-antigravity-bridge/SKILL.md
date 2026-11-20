@@ -1,14 +1,15 @@
 ---
 name: codex-antigravity-bridge
 description: >-
-  Executes structured tasks when the first non-empty line is [DIRECTOR_TASK], or when the user explicitly requests submission to Antigravity for review.
+  Executes structured [DIRECTOR_TASK] dispatches, or when the user explicitly requests submission to Antigravity for review.
 ---
 
 # Codex-Antigravity-Bridge — Codex 执行端
 
 ## 1. Activation Guard (严格按需触发)
 
-- 仅当消息的**首个非空行**是 `[DIRECTOR_TASK]`，或用户明确要求向 Antigravity（反重力）提交评审时启用本技能。
+- 仅当消息以 `[DIRECTOR_TASK]` 封包开头（可紧跟宿主授权指令之后），或用户明确要求向 Antigravity（反重力）提交评审时启用本技能。
+- 仓库只读派发可在封包前带一行宿主授权指令。封包标记 [RECEIPT_AUTHORIZATION: once] 时，通过当前派发专用的 agy_submit_dispatch_receipt 回传一次结果，并在最终回复中带上返回的 request_id。使用仓库只读沙箱，遵循派发范围。普通派发可通过 agy_submit_for_review 传入封包的 dispatch_id 来关联回执。
 - 普通对话按常规流程处理。
 
 ### 制定计划前确认双边模型选型

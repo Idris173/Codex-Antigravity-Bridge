@@ -245,6 +245,24 @@ name = "Existing"
 
 
 class MergeAndLocaleTests(TemporaryHomeTest):
+    def test_opt_in_antigravity_notifications_preserve_other_sidecars(self):
+        initial = {"sidecars": {"unrelated": {"enabled": True}}, "other": "keep"}
+        self.seed(self.layout.antigravity_config, install.json_bytes(initial))
+        conversation_id = "12345678-1234-1234-1234-123456789abc"
+        edits = install.antigravity_notification_edits(self.layout, Path(PYTHON), ROOT, conversation_id)
+        for path, old, new in edits:
+            install.write_config(path, old, new)
+        manifest = json.loads(self.layout.antigravity_sidecar.read_bytes())
+        self.assertEqual(manifest["args"][2:4], [str(ROOT), conversation_id])
+        settings = json.loads(self.layout.antigravity_config.read_bytes())
+        self.assertEqual(settings["sidecars"][install.AGY], {"enabled": True})
+        for _, old, new in install.antigravity_notification_edits(self.layout, Path(PYTHON), ROOT, conversation_id):
+            self.assertEqual(old, new)
+        for path, old, new in install.antigravity_notification_edits(self.layout):
+            install.write_config(path, old, new)
+        self.assertFalse(self.layout.antigravity_sidecar.exists())
+        self.assertEqual(json.loads(self.layout.antigravity_config.read_bytes()), initial)
+
     def test_uninstall_keeps_custom_files_and_completes_after_unlock(self):
         _, edits = install.plans(self.layout, Path(PYTHON))
         for path, _, updated in edits:
@@ -350,6 +368,35 @@ class BridgeLogicTests(TemporaryHomeTest):
         patches.start()
         self.addCleanup(patches.stop)
 
+    def test_notifications_retry_and_only_notify_new_messages_for_bound_workspace(self):
+        from bridge import notify_inbox
+
+        bus = self.layout.bridge / "bus"
+        workspace = self.layout.home / "bound repository"
+        conversation_id = "12345678-1234-1234-1234-123456789abc"
+        for request_id, submitted_from in (
+            ("req_9_aabbcc", workspace),
+            ("req_10_aabbcc", self.layout.home / "another repository"),
+            ("req_11_aabbcc", workspace),
+        ):
+            self.bridge._atomic_write_json(self.bridge._request_path(request_id), {
+                "request_id": request_id, "status": "pending", "workspace_path": str(submitted_from),
+                "step_summary": "Read it through MCP",
+            })
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bus, tool_check_codex_inbox=self.bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox.subprocess, "run", side_effect=[OSError("not ready"), None]) as send:
+                args = (str(workspace), conversation_id, 10, "agentapi")
+                with self.assertRaises(OSError):
+                    notify_inbox.notify_pending(*args)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(notify_inbox.notify_pending(*args), "req_11_aabbcc")
+                self.assertIsNone(notify_inbox.notify_pending(*args))
+            self.assertEqual(send.call_count, 2)
+            command = send.call_args.args[0]
+            self.assertEqual(command[:3], ["agentapi", "send-message", conversation_id])
+            self.assertIn("req_11_aabbcc", command[3])
+            self.assertNotIn("Read it through MCP", command[3])
+
     def test_routing_catalog_reads_isolated_cache_and_persists_profiles(self):
         home = self.layout.codex.parent
         get = {"codex_home": str(home)}
@@ -429,6 +476,86 @@ class BridgeLogicTests(TemporaryHomeTest):
         self.assertTrue(self.bridge.tool_reply_to_codex(second_id)["already_replied"])
         self.assertEqual(self.bridge.tool_reply_to_codex(second_id, "REWORK_REQUIRED")["error_code"], "ALREADY_REPLIED")
         self.assertEqual(self.bridge.tool_reply_to_codex()["reply"]["request_id"], first_id)
+
+    def test_read_only_dispatch_has_one_scoped_receipt_and_persistent_acknowledgement(self):
+        bridge = self.bridge
+        workspace = str(self.layout.home)
+        binding = bridge.tool_bind_session(workspace_path=workspace, transport="codex_exec")
+        with mock.patch.object(bridge.HeadlessCodexRunner, "dispatch", return_value={
+            "ok": True, "timed_out": True, "status": "running_async",
+        }) as dispatch:
+            result = bridge.tool_dispatch_task(
+                "核对分支", "根据所附输出汇报分支", binding_id=binding["binding_id"],
+                repository_read_only=True, authorize_receipt=True,
+            )
+        dispatch_id = result["dispatch_id"]
+        self.assertEqual(result["lifecycle"]["execution"]["status"], "awaiting_completion")
+        self.assertEqual(result["lifecycle"]["receipt"]["status"], "awaiting")
+        self.assertTrue(dispatch.call_args.kwargs["repository_read_only"])
+        self.assertTrue(dispatch.call_args.kwargs["envelope"].startswith("$stop-that-shit change --"))
+        self.assertIn("[RECEIPT_AUTHORIZATION: once]", dispatch.call_args.kwargs["envelope"])
+        scoped = bridge._scoped_codex_tools(dispatch_id)
+        self.assertEqual({tool["name"] for tool in scoped}, {
+            "agy_submit_dispatch_receipt", "agy_fetch_director_reply",
+        })
+        self.assertEqual(bridge._dispatch_mcp_tool(
+            "codex", "agy_submit_for_review", {"step_summary": "generic"}, dispatch_id,
+        )["error_code"], "DISPATCH_SCOPE_FORBIDS_TOOL")
+        self.assertEqual(bridge.codex_tool_submit_for_review(
+            "generic", dispatch_id=dispatch_id, wait_for_reply=False,
+        )["error_code"], "SCOPED_RECEIPT_REQUIRED")
+        self.assertEqual(bridge._dispatch_mcp_tool(
+            "codex", "agy_submit_dispatch_receipt", {"step_summary": "result"},
+        )["error_code"], "UNKNOWN_CODEX_TOOL")
+
+        args = {"step_summary": "main tracks origin/main"}
+        def submit(arguments):
+            return bridge._dispatch_mcp_tool("codex", "agy_submit_dispatch_receipt", arguments, dispatch_id)
+
+        self.assertEqual(submit({**args, "workspace_path": "elsewhere"})["error_code"], "INVALID_ARGUMENTS")
+        queued = submit(args)
+        request_id = queued["request_id"]
+        self.assertFalse(queued["already_queued"])
+        self.assertEqual(queued["dispatch_id"], dispatch_id)
+        self.assertEqual(submit(args)["request_id"], request_id)
+        self.assertTrue(submit(args)["already_queued"])
+        self.assertEqual(submit({"step_summary": "second"})["error_code"], "RECEIPT_ALREADY_SUBMITTED")
+        self.assertEqual(len(list((bridge.BUS_DIR / "requests").glob("*.json"))), 1)
+
+        dispatch.call_args.kwargs["on_complete"]({
+            "ok": True, "codex_session_id": "codex-session", "turn_id": "turn",
+        })
+        status = bridge.tool_dispatch_status(dispatch_id)
+        self.assertEqual(status["execution"]["status"], "completed")
+        self.assertEqual(status["receipt"]["status"], "queued")
+        inbox = bridge.tool_check_codex_inbox(request_id, workspace)["submission"]
+        self.assertEqual(inbox["dispatch_id"], dispatch_id)
+        self.assertEqual(inbox["step_summary"], args["step_summary"])
+        self.assertEqual(bridge.tool_dispatch_status(dispatch_id)["receipt"]["status"], "queued")
+        reply = bridge.tool_reply_to_codex(request_id, review_feedback="确认收到")["reply"]
+        self.assertEqual(reply["dispatch_id"], dispatch_id)
+        self.assertEqual(bridge._dispatch_mcp_tool(
+            "codex", "agy_fetch_director_reply", {}, dispatch_id,
+        ), reply)
+        self.assertTrue(bridge.tool_unbind_session(binding["binding_id"])["ok"])
+        status = bridge.tool_dispatch_status(dispatch_id)
+        self.assertEqual(status["receipt"]["status"], "acknowledged")
+        self.assertEqual(status["receipt"]["acknowledged_at"], reply["replied_at"])
+
+    def test_read_only_dispatch_does_not_grant_a_receipt_implicitly(self):
+        bridge = self.bridge
+        binding = bridge.tool_bind_session(workspace_path=str(self.layout.home), transport="codex_exec")
+        self.assertEqual(bridge.tool_dispatch_task(
+            "goal", "instructions", binding_id=binding["binding_id"], authorize_receipt=True,
+        )["error_code"], "RECEIPT_REQUIRES_READ_ONLY")
+        with mock.patch.object(bridge.HeadlessCodexRunner, "dispatch", return_value={"ok": True}):
+            result = bridge.tool_dispatch_task(
+                "goal", "instructions", binding_id=binding["binding_id"], repository_read_only=True,
+            )
+        self.assertEqual(result["lifecycle"]["receipt"]["status"], "not_authorized")
+        self.assertEqual(bridge._dispatch_mcp_tool(
+            "codex", "agy_submit_dispatch_receipt", {"step_summary": "result"}, result["dispatch_id"],
+        )["error_code"], "DISPATCH_SCOPE_FORBIDS_TOOL")
 
     def test_wait_only_new_skips_initial_requests(self):
         old = {"request_id": "req_1_aaaaaa"}

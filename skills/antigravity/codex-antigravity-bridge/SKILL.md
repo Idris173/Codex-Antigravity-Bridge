@@ -43,6 +43,9 @@ description: >-
   - 切换窗口已有会话传：`switch_to_session="<会话名>"`；
 - 一步原子完成加锁并记录专属 `binding_id`，随后携带该 `binding_id` 调用 `bridge_dispatch_task`。
 
+- 若制作人明确授权只读任务回传一次结果，通过无头绑定派发，传入 `repository_read_only=true` 和 `authorize_receipt=true`。仓库使用只读沙箱，Codex 只能用派发专用的回执工具写入该请求。
+- 用 `bridge_dispatch_status(dispatch_id=...)` 查询派发、执行完成、回执入箱和批复状态。读到并核对结果后，以同一 `request_id` 调用 `bridge_reply_to_codex`，记录收件确认。
+
 ### 路径 C：同一任务多轮迭代期间（零重复探测直发）
 - 一旦已通过 `bridge_bind_session` 加锁，后续连续派发子步骤或打回返工时，**严禁重复调用 `bridge_inspect_app` 或 `bridge_bind_session`**，直接携带 `binding_id` 调用 `bridge_dispatch_task`。
 - 若返回 `timed_out: true, reply_confirmed: false`，可稍后调用 `bridge_read_latest` 取回回复。若返回 `DAEMON_EXEC_UNCERTAIN`，先按原 `dispatch_id` 核实会话状态，再决定是否重新派发。

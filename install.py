@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import dataclass
 
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
 SKILL_NAME = "codex-antigravity-bridge"
@@ -27,7 +27,7 @@ CODEX_TABLE = ("mcp_servers", CODEX)
 UTF8_ENV = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 TOOLS = {
     AGY: {
-        "bridge_inspect_app", "bridge_bind_session", "bridge_dispatch_task",
+        "bridge_inspect_app", "bridge_bind_session", "bridge_dispatch_task", "bridge_dispatch_status",
         "bridge_read_latest", "bridge_create_project_session", "bridge_unbind_session",
         "bridge_check_codex_inbox", "bridge_reply_to_codex", "bridge_routing_settings",
     },
@@ -85,6 +85,14 @@ class Layout:
     @property
     def gemini(self):
         return self.home / ".gemini/config/mcp_config.json"
+
+    @property
+    def antigravity_config(self):
+        return self.home / ".gemini/config/config.json"
+
+    @property
+    def antigravity_sidecar(self):
+        return self.bridge / "sidecar.json"
 
     @property
     def codex(self):
@@ -154,6 +162,49 @@ def load_json(data):
     if not isinstance(result, dict):
         raise ValueError("MCP JSON configuration must contain an object.")
     return result
+
+
+def antigravity_notification_edits(layout, python=None, workspace=None, conversation_id=None):
+    manifest = layout.check_path(layout.antigravity_sidecar)
+    original_manifest = read_bytes(manifest)
+    previous = load_json(original_manifest)
+    script = str(layout.bridge / "notify_inbox.py")
+    args = previous.get("args", [])
+    owns_manifest = isinstance(args, list) and len(args) == 5 and args[:2] == ["-B", script]
+    if conversation_id is None and not owns_manifest:
+        return []
+    if original_manifest is not None and not owns_manifest:
+        raise ValueError(f"An unrelated Antigravity sidecar already exists: {manifest}")
+
+    config_path = layout.check_path(layout.antigravity_config)
+    original_config = read_bytes(config_path)
+    config = load_json(original_config)
+    sidecars = configuration_map(config, "sidecars")
+    before = dict(sidecars)
+    if conversation_id is None:
+        sidecars.pop(AGY, None)
+        updated_manifest = None
+    else:
+        target = [str(workspace), conversation_id]
+        since = args[4] if owns_manifest and args[2:4] == target else str(time.time_ns() // 1_000_000)
+        sidecars[AGY] = {**configuration_map(sidecars, AGY), "enabled": True}
+        updated_manifest = json_bytes({
+            "display_name": "Codex Bridge Inbox",
+            "description": "Notifies a selected Antigravity conversation of new Codex messages.",
+            "command": str(python),
+            "args": ["-B", script, *target, since],
+        })
+    updated_config = original_config
+    if sidecars != before:
+        if sidecars:
+            config["sidecars"] = sidecars
+        else:
+            config.pop("sidecars", None)
+        updated_config = json_bytes(config)
+    return [
+        (manifest, original_manifest, updated_manifest),
+        (config_path, original_config, updated_config),
+    ]
 
 
 def configuration_map(config, key):
@@ -491,8 +542,10 @@ def confirm_python(python):
         raise ValueError(f"Python 3.11 or later is required: {python}")
 
 
-def install(layout, python):
+def install(layout, python, workspace=None, conversation_id=None):
     state, edits = plans(layout, python)
+    if conversation_id:
+        edits.extend(antigravity_notification_edits(layout, python, workspace, conversation_id))
     confirm_python(python)
     changed = copy_assets(layout)
     dll_ok = compile_dll(layout, changed)
@@ -508,6 +561,7 @@ class LockedBridgeLibrary(PermissionError):
 
 def uninstall(layout):
     _, edits = plans(layout)
+    edits.extend(antigravity_notification_edits(layout))
     owns_installation = layout.state.is_file() or any(old != new for _, old, new in edits)
     if not owns_installation:
         return []
@@ -530,10 +584,12 @@ def uninstall(layout):
     files.extend(path for path in bindings.glob(".tmp_last_msg_*.txt"))
     bus = layout.check_path(bridge / "bus")
     requests = layout.check_path(bus / "requests")
-    files.extend(bus / name for name in ("to_antigravity.json", "to_codex_latest.json", "replies.mutex"))
+    dispatches = layout.check_path(bus / "dispatches")
+    files.extend(path for path in dispatches.glob("*.json") if re.fullmatch(r"[0-9a-f]{32}(?:\.execution)?\.json", path.name))
+    files.extend(bus / name for name in ("to_antigravity.json", "to_codex_latest.json", "replies.mutex", "antigravity_notifications.json"))
     files.extend(path for path in requests.glob("req_*.json") if re.fullmatch(r"req_\d+_[0-9a-f]{6,32}\.json", path.name))
     files.extend(path for path in bus.glob("to_codex_req_*.json") if re.fullmatch(r"to_codex_req_\d+_[0-9a-f]{6,32}\.json", path.name))
-    directories = {bridge, bindings, bus, requests}
+    directories = {bridge, bindings, bus, requests, dispatches}
     for source, destination in layout.skills:
         layout.check_path(destination)
         directories.add(destination)
@@ -681,6 +737,7 @@ def main(argv=None):
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--doctor", action="store_true", help="Report both MCP handshakes as JSON.")
     modes.add_argument("--uninstall", action="store_true", help="Remove the suite and its local bridge state.")
+    modes.add_argument("--agy-conversation-id", help="Notify this Antigravity conversation of new Codex messages for the current workspace.")
     parser.add_argument("--home-dir", type=Path, default=Path.home(), help="Override the installation home.")
     parser.add_argument("--python-exe", type=Path, default=Path(sys.executable), help="Interpreter for both MCP registrations.")
     parser.add_argument("--lang", choices=("auto", "zh", "en"), default="auto", help="CLI language.")
@@ -701,7 +758,10 @@ def main(argv=None):
             backups = uninstall(layout)
             print(text["removed"])
         else:
-            backups, dll_ok = install(layout, args.python_exe.expanduser().resolve())
+            conversation_id = args.agy_conversation_id
+            if conversation_id is not None and not re.fullmatch(r"[0-9a-zA-Z-]{32,128}", conversation_id):
+                raise ValueError("Invalid Antigravity conversation ID.")
+            backups, dll_ok = install(layout, args.python_exe.expanduser().resolve(), Path.cwd().resolve(), conversation_id)
             print(text["installed"])
             if not dll_ok:
                 print(f'{text["warning"]}: {text["dll_deferred"]}', file=sys.stderr)
