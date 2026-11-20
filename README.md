@@ -1,22 +1,39 @@
 # Codex-Antigravity-Bridge
 
-**Antigravity (Tech Director) ↔ ChatGPT / Codex (Worker) Bidirectional Local MCP & Game Dev Skill Suite**  
-面向游戏制作者（Unreal Engine & Three.js）的 **Antigravity（反重力技术总监）↔ ChatGPT / Codex（执行主程）** 本机双边对称 MCP 与按需技能套件。
+English | [简体中文](./README.zh-CN.md)
+
+A general-purpose local MCP communication bridge between **OpenAI Codex** (ChatGPT Desktop App / Codex CLI) and **Google Antigravity** on Windows.
 
 Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
 ---
 
-## Quick Start (English)
+## Overview
 
-### Requirements
-- **Windows 10 / 11**, **Python 3.11+**, **Antigravity**, and **ChatGPT Desktop App** (with Codex mode).
+`Codex-Antigravity-Bridge` connects the Antigravity MCP server (`chatgpt-bridge`) and the Codex MCP server (`antigravity_bridge`) through a local Python sidecar and shared inbox.
 
-### One-Command Identical Install (via Antigravity OR ChatGPT/Codex)
-Clone this repo or tell **either** Antigravity or ChatGPT/Codex:
-> *"Clone `https://github.com/Idris173/Codex-Antigravity-Bridge` and install this skill suite for me."*
+- **On-Demand & Dormant by Default**: Installed skills stay completely silent during normal chats and activate only when you explicitly ask Antigravity and Codex to collaborate or exchange messages.
+- **Dual Transport (Headless Concurrent CLI + Fast UIA)**:
+  - **Headless Multi-Session (`codex_exec`)**: Drives the bundled `codex.exe exec / resume` CLI in the background with isolated `binding_id` records—supporting multiple workspaces in parallel even when both desktop apps are minimized, with zero focus changes or clipboard writes.
+  - **Desktop Window (`uia`)** uses Windows UI Automation to send requests to a Codex window and reads the local session log to match results by `dispatch_id`.
+- **Codex → Antigravity** sends requests and results to the local inbox through MCP. Antigravity replies using the same `request_id`.
+- **Language Auto-Matching**: English prompts keep the entire coordination loop in English; Simplified Chinese prompts keep the entire loop in Simplified Chinese.
+- **Model, Effort & Speed Routing**: Query available models, reasoning effort levels, and speed tiers (`Standard`, `Fast`, and `Ultrafast` where supported, such as `GPT-6.2-Sol`) across both hosts via `bridge_routing_settings` / `agy_routing_settings`.
 
-Both agents automatically read `AGENTS.md` and run the deterministic installer:
+---
+
+## Requirements
+
+- **Windows 10 / 11**
+- **Python 3.11+** (standard library only; zero third-party packages)
+- **Google Antigravity**
+- **OpenAI ChatGPT Desktop App** (with Codex enabled)
+
+---
+
+## Installation & Health Check
+
+Running `install.py` from either Antigravity or ChatGPT/Codex produces the exact same installation state (see [AGENTS.md](./AGENTS.md)):
 
 ```powershell
 git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
@@ -25,60 +42,173 @@ python install.py
 python install.py --doctor
 ```
 
-- **Language Auto-Matching**: Ask in English → both agents coordinate and reply in English throughout; ask in Chinese → both agents coordinate and reply in Chinese throughout.
-- **Note**: Restart the ChatGPT Desktop App once after first install so Codex loads the native `antigravity_bridge` MCP tools. To uninstall cleanly: `python install.py --uninstall`.
+What `install.py` configures non-destructively:
 
-### Planning and review
+1. Copies the bridge runtime (`bridge_server.py`, `headless_multi_engine.py`, `notify_inbox.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll`.
+2. Installs the on-demand skills to `~/.gemini/config/skills/codex-antigravity-bridge/` and `~/.codex/skills/codex-antigravity-bridge/`.
+3. Creates timestamped `.bak` backups before non-destructively merging `chatgpt-bridge` into `~/.gemini/config/mcp_config.json` and `[mcp_servers.antigravity_bridge]` into `~/.codex/config.toml` (preserving all existing MCP servers).
 
-- Use `bridge_routing_settings` in Antigravity or `agy_routing_settings` in Codex to choose the host, model, reasoning effort, and speed for the decision and worker roles. The planning prompt is enabled by default. GPT-6.2-Sol supports Standard, Fast, and Ultrafast. Saved choices appear in the task's `[ROUTING: ...]` header. Configure the chosen model and speed in the corresponding client.
-- Filter review submissions by `workspace_path`. Include a `request_id` when replying to an inbox with multiple pending requests. Add `--only-new` to `cli wait_inbox` to wait for submissions that arrive after the command starts.
-- Upgrading archives the previous skill folders under `~/.gemini/config/sidecars/chatgpt-bridge/`. Reinstalling retains `director_settings.json`. Uninstall preserves user-added files and saved routing choices. If the UI Automation DLL is in use, exit the host and rerun `--uninstall`.
+> **First-Install Note**: If the ChatGPT Desktop App is already running during first install, **restart the ChatGPT Desktop App once** so Codex loads the `antigravity_bridge` MCP server.
 
 ---
 
-## 快速上手（简体中文）
+## Bidirectional Usage
 
-### 核心特性
-1. **三重门禁，平时完全休眠**：日常聊天零干扰；仅在**你明确下达指挥指令 + ChatGPT 桌面端已开启 + 目标工程/会话已锁定**时激活。
-2. **中英双语全链路自适应**：用中文提问则全程（微缩 Spec、派发指令、审查报告）一直使用中文；用英文提问则全程一直使用英文；同时兼容中/英文界面的 ChatGPT 桌面客户端。
-3. **双边对称 MCP 极速直连（无需 `computer-use`）**：
-   - **正向（Antigravity → Codex）**：预编译 C# `CacheRequest` 热管道（探测 `~260ms`）+ 本地 `.codex/sessions/rollout-*.jsonl` `35ms` 零延迟无损流截获（按 `dispatch_id` 精确归属）。
-   - **反向（Codex → Antigravity）**：Codex 原生挂载 `antigravity_bridge` MCP，走本地并发安全文件总线（`<40ms` IPC），无需调用 `computer-use` 截屏或抢鼠标。
-4. **真·多会话并发与双端最小化无感运行**：每个会话拥有独立 `binding_id`（`bindings/<binding_id>.json` 零顶锁），调用 `bridge_bind_session(workspace_path="...", transport="codex_exec")` 时直接驱动 Codex 桌面端内置的无头 `codex.exe exec / resume` 引擎并精确应用所选模型、强度与速度（即使反重力与 ChatGPT 两个窗口**全部最小化**也可多工程并发施工、零抢焦点、零动剪贴板）；桌面窗口模式亦支持 `SW_SHOWNOACTIVATE` 后台展开与剪贴板无损恢复。内置 Unreal Engine 与 Three.js 审查红线。
-5. **计划阶段双边选型**：用 `bridge_routing_settings`（反重力）或 `agy_routing_settings`（Codex）查看目录并分别选择决策与施工的宿主、模型、推理强度和速度。默认每次制定计划前询问。GPT-6.2-Sol 提供标准、快速和 **超快（Ultrafast）**。保存的选型进入 `[ROUTING: ...]`，无头并发模式自动透传 `-m` / `model_reasoning_effort` / `service_tier` 参数。
-6. **工程收件箱**：可用 `workspace_path` 筛选待审单。存在多张待审单时，批复必须带 `request_id`。用 `cli wait_inbox --only-new` 等待监听开始后的新提交。
+### 1. Antigravity → Codex (Bind, Dispatch & Collect)
 
-### 一键对等安装（反重力或 GPT 运行结果完全一致）
+#### Headless Multi-Session Mode (Recommended for Local Workspaces)
 
-无论你的朋友在 **反重力（Antigravity）** 还是在 **ChatGPT（Codex）** 中操作，只需对任意一方说：
+Runs concurrently across multiple workspaces and works even when both Antigravity and ChatGPT Desktop are minimized:
 
-> “克隆或打开 `https://github.com/Idris173/Codex-Antigravity-Bridge`，帮我安装并验证这套双边技能。”
+```json
+// 1) Bind a workspace session (Tool: bridge_bind_session)
+{
+  "workspace_path": "C:/path/to/workspace",
+  "transport": "codex_exec",
+  "codex_model": "gpt-6.2-sol",
+  "codex_effort": "high",
+  "codex_speed": "ultrafast",
+  "engine": "general",
+  "mode": "autopilot"
+}
 
-或者直接在终端执行：
-
-```powershell
-git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
-cd Codex-Antigravity-Bridge
-python install.py
-python install.py --doctor
+// 2) Dispatch a task using the returned binding_id (Tool: bridge_dispatch_task)
+{
+  "binding_id": "<binding_id>",
+  "step_goal": "Summarize workspace setup",
+  "task_instruction": "Read README.md and list the installation requirements.",
+  "repository_read_only": true
+}
 ```
 
-> **首次安装提示**：安装脚本会自动备份并无损合并原有的 `~/.gemini/config/mcp_config.json` 与 `~/.codex/config.toml`（保留你已有的全部其他 MCP 服务）。若安装时 ChatGPT 桌面应用已打开，请**重启一次 ChatGPT 桌面应用**以加载原生 `antigravity_bridge` 工具。
+- If a long-running task exceeds the synchronous wait window (`timed_out: true`), it continues in the background; check progress or retrieve the result with `bridge_dispatch_status(dispatch_id="<dispatch_id>")` or `bridge_read_latest(binding_id="<binding_id>")`.
+- For read-only verification tasks that are authorized to write back one receipt, pass `"repository_read_only": true` and `"authorize_receipt": true` to `bridge_dispatch_task`.
+- Release a session binding when finished with `bridge_unbind_session(binding_id="<binding_id>")`.
 
-升级时，安装器会把旧版技能目录备份到 `~/.gemini/config/sidecars/chatgpt-bridge/`。重新安装会保留 `director_settings.json`。运行 `python install.py --uninstall` 会保留用户附加文件与已保存的选型。若 UI 自动化 DLL 正被占用，退出宿主后重跑卸载。
+#### Desktop Window Mode
+
+Inspect open ChatGPT windows with `bridge_inspect_app()`, bind a target project or conversation via `bridge_bind_session(create_in_project="<project>", engine="general", mode="semi_auto")` or `switch_to_session="<session>"`, and send tasks with `bridge_dispatch_task(binding_id="<binding_id>", ...)`.
 
 ---
 
-## Repository Layout / 目录结构
+### 2. Codex → Antigravity (Submit & Reply by `request_id`)
+
+#### Step A — Codex Submits a Message or Change Summary
+
+Codex calls `agy_submit_for_review` on the `antigravity_bridge` MCP server (or `agy_submit_dispatch_receipt` during an authorized read-only dispatch):
+
+```json
+// Tool: agy_submit_for_review
+{
+  "workspace_path": "C:/path/to/workspace",
+  "step_summary": "Completed parser update and unit test coverage.",
+  "changed_files": "src/parser.py, tests/test_parser.py",
+  "self_check": "Ran python -B -m unittest discover -s tests -v; all tests passed.",
+  "open_questions": "NONE",
+  "wait_for_reply": false
+}
+```
+
+- When `wait_for_reply` is `true` (default), the call blocks on the local IPC bus and returns Antigravity's reply as soon as it arrives.
+- When `wait_for_reply` is `false`, the call returns `"status": "queued"` and a unique `request_id`. Give that ID to Codex to look up the reply later.
+
+#### Step B — Antigravity Checks the Inbox & Replies by `request_id`
+
+From Antigravity, read pending submissions (optionally scoped by `workspace_path` or `request_id`) and write the response back to the **same `request_id`** via `chatgpt-bridge` MCP tools:
+
+```json
+// 1) Inspect inbox (Tool: bridge_check_codex_inbox)
+{
+  "request_id": "req_1700000000000_a1b2c3d4e5f6",
+  "workspace_path": "C:/path/to/workspace"
+}
+
+// 2) Reply to that exact request_id (Tool: bridge_reply_to_codex)
+{
+  "request_id": "req_1700000000000_a1b2c3d4e5f6",
+  "decision": "APPROVED",
+  "review_feedback": "Verified changes and test results.",
+  "next_instruction": "Proceed to the next task."
+}
+```
+
+> When more than one request is pending in the inbox, passing `request_id` to `bridge_reply_to_codex` is required so replies never target the wrong submission.
+
+You can also inspect, wait on, or reply to inbox requests from the CLI:
+
+```powershell
+# Wait only for new submissions arriving after the listener starts
+python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli wait_inbox --timeout 600 --only-new
+
+# Inspect current pending submissions
+python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli check_inbox
+
+# Reply to a specific request_id
+python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli reply_codex `
+  --request-id req_1700000000000_a1b2c3d4e5f6 `
+  --decision APPROVED `
+  --feedback "Verified changes and test results." `
+  --next "Proceed to the next task."
+```
+
+---
+
+### 3. Model, Effort & Speed Routing
+
+Call `bridge_routing_settings` in Antigravity or `agy_routing_settings` in Codex to read or save model, reasoning effort, and speed preferences. Supported speed tiers depend on the model.
+
+---
+
+## Optional Antigravity Conversation Notifications
+
+By default, inbox checks are on-demand or polled via `cli wait_inbox`. If you want new Codex inbox submissions from a specific workspace (and its subdirectories) to automatically wake a chosen Antigravity conversation:
+
+1. Run `install.py` **from the target workspace directory** with `--agy-conversation-id`:
+
+   ```powershell
+   cd C:\path\to\target-workspace
+   python "C:\path\to\Codex-Antigravity-Bridge\install.py" --agy-conversation-id "CONVERSATION_ID"
+   ```
+
+2. **Requirements & Behavior**:
+   - Configures `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json` and enables `sidecars.chatgpt-bridge` in `~/.gemini/config/config.json`.
+   - Uses Antigravity's sidecar `agentapi send-message` (requires `agentapi` to be available on the Antigravity sidecar `PATH`) to notify `<conversation-id>` when a new eligible `request_id` arrives for that workspace.
+   - The notified Antigravity conversation reads the submission via `bridge_check_codex_inbox` and replies with `bridge_reply_to_codex` under its existing permissions.
+   - Restart Antigravity if the sidecar does not start immediately after the configuration change.
+   - To pause automatic notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.
+
+---
+
+## Uninstall & Testing
+
+To remove the suite while preserving unrelated MCP servers, user-added files, and saved routing preferences:
+
+```powershell
+python install.py --uninstall
+```
+
+*(If `BridgeFastUia.dll` is currently loaded by a running host process, close the host and rerun `python install.py --uninstall` to complete cleanup.)*
+
+To run the isolated test suite (uses temporary `--home-dir` directories without touching host configuration):
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+---
+
+## Repository Layout
 
 ```text
 Codex-Antigravity-Bridge/
 ├── AGENTS.md                   # Deterministic setup guide for both Antigravity & Codex
-├── README.md                   # Bilingual documentation (EN / zh-CN)
-├── install.py                  # Zero-dependency installer / --doctor / --uninstall
-├── bridge/                     # Bidirectional MCP server + headless multi-engine + fast UIA
+├── README.md                   # English documentation
+├── README.zh-CN.md             # Simplified Chinese documentation
+├── install.py                  # Standard-library installer / --doctor / --uninstall
+├── bridge/                     # Bidirectional MCP server, headless engine, sidecar notifier & UIA
 │   ├── bridge_server.py
 │   ├── headless_multi_engine.py
+│   ├── notify_inbox.py
 │   ├── BridgeFastUia.cs
 │   ├── uia_driver.ps1
 │   └── uia_daemon.ps1
