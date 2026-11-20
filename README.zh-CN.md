@@ -2,7 +2,7 @@
 
 [English](./README.md) | 简体中文
 
-面向 Windows 本地环境的 **OpenAI Codex**（ChatGPT 桌面应用 / Codex CLI）与 **Google Antigravity** 通用双向 MCP 通信桥接方案。
+本地运行的 **OpenAI Codex**（ChatGPT 桌面应用 / Codex CLI）与 **Google Antigravity** 通用双向 MCP 通信桥接方案。Windows 支持无头和桌面窗口两种模式，本分支新增 macOS 无头预览。
 
 仓库地址：[https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
@@ -14,7 +14,7 @@
 
 - **按需唤醒，日常休眠**：双端配套技能在普通对话中保持静默，仅在你明确要求跨端协作或收发消息时启用。
 - **双通道传输（无头多会话并发 + 快速 UI 自动化）**：
-  - **无头多会话模式（`codex_exec`）**：直接驱动 Codex 内置的 `codex.exe exec / resume` 后台进程，按独立 `binding_id` 隔离会话；支持多工作区同时并行运行，即使 Antigravity 与 ChatGPT 桌面端全部处于最小化状态也可无感收发（零焦点切换、零剪贴板写入）。
+  - **无头多会话模式（`codex_exec`）**在后台运行 `codex exec / resume`。每条绑定使用自己的工作区和会话，可并行派发。
   - **桌面窗口模式（`uia`）**使用 Windows UI 自动化向 Codex 窗口发送请求，并从本地会话日志按 `dispatch_id` 匹配结果。
 - **Codex → Antigravity** 通过 MCP 将请求和结果投递到本地收件箱，Antigravity 使用同一 `request_id` 回执。
 - **中英双语自适应**：英文提问全程以英文协同与回复；简体中文提问全程以简体中文协同与回复。
@@ -24,16 +24,18 @@
 
 ## 环境要求
 
-- **Windows 10 / 11**
+- **Windows 10 / 11** 或本分支预览支持的 **macOS**
 - **Python 3.11+**（仅使用标准库，零第三方依赖）
 - **Google Antigravity**
-- **OpenAI ChatGPT 桌面应用**（开启 Codex 功能）
+- **OpenAI Codex**。macOS 需要安装并登录 [Codex CLI](https://learn.chatgpt.com/docs/cli)，并确认终端里的 `codex --version` 能运行。发送桥接请求时，可以用 Codex CLI 或 ChatGPT 桌面应用。
 
 ---
 
 ## 安装与健康检查
 
-无论从 Antigravity 还是从 ChatGPT / Codex 执行安装脚本，都会生成字节级一致的安装结果（详见 [AGENTS.md](./AGENTS.md)）：
+在仓库根目录运行对应平台的安装命令。[安装约定](./AGENTS.md)
+
+### Windows
 
 ```powershell
 git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
@@ -42,9 +44,25 @@ python install.py
 python install.py --doctor
 ```
 
+### macOS 无头预览
+
+检出 `macos-headless` 分支。在能运行 `codex --version` 的终端执行以下命令。
+
+```sh
+python3 install.py
+python3 install.py --doctor
+```
+
+首次安装后，重新打开 Antigravity 和 Codex 客户端。两边打开同一个项目，填写目录时用绝对路径，例如 `/Users/you/Projects/example`。
+
+1. 对 Antigravity 说「请让 Codex 只看项目的 README。我授权它回一条结果。」使用该目录的无头绑定派发。
+2. 对 Codex 说「请把这条消息发给 Antigravity，等它回复后告诉我。」Antigravity 可以手动看收件箱。需要自动收件时，从目标工作区用 `python3` 运行[可选通知配置](#可选功能antigravity-会话自动通知)。
+
+健康检查会验证已配置的 Codex CLI 和两端 MCP 连接。POSIX 测试使用隔离目录和模拟 Codex CLI。实际 Mac 上的桌面应用联调仍待验证。
+
 `install.py` 会执行以下非破坏性配置：
 
-1. 将桥接运行时（`bridge_server.py`、`headless_multi_engine.py`、`notify_inbox.py`、`agy_model_guard.py`、`codex_projects.py`、`BridgeFastUia.cs`、`uia_driver.ps1`、`uia_daemon.ps1`）部署至 `~/.gemini/config/sidecars/chatgpt-bridge/`，并使用本机 `.NET` 工具链预编译 `BridgeFastUia.dll`。
+1. 将 Python 桥接运行时部署至 `~/.gemini/config/sidecars/chatgpt-bridge/`。Windows 额外部署窗口自动化文件并预编译 `BridgeFastUia.dll`。macOS 会为 Antigravity 后台进程记录 Codex CLI 的路径及安装终端的 `PATH`。
 2. 将双侧按需技能分别安装至 `~/.gemini/config/skills/codex-antigravity-bridge/` 与 `~/.codex/skills/codex-antigravity-bridge/`。
 3. 在修改配置前自动生成带时间戳的 `.bak` 备份，并将 `chatgpt-bridge` 与 `[mcp_servers.antigravity_bridge]` 无损合并至 `~/.gemini/config/mcp_config.json` 和 `~/.codex/config.toml`（完整保留已有的全部其他 MCP 服务）。
 
@@ -87,7 +105,7 @@ python install.py --doctor
 - 对于仅需只读核查并授权回写一条回执的任务，可在 `bridge_dispatch_task` 中传入 `"repository_read_only": true` 与 `"authorize_receipt": true`。
 - 任务结束后调用 `bridge_unbind_session(binding_id="<binding_id>")` 释放绑定。
 
-#### 桌面窗口模式
+#### 桌面窗口模式（Windows）
 
 先调用 `bridge_inspect_app()` 查看当前打开的 ChatGPT 窗口与侧边栏项目/会话列表，再通过 `bridge_bind_session(create_in_project="<项目名>", engine="general", mode="semi_auto")` 或 `switch_to_session="<会话名>"` 锁定目标会话，随后携带 `binding_id` 调用 `bridge_dispatch_task`。
 
@@ -245,6 +263,8 @@ python install.py --uninstall
 ```
 
 *（若卸载时 `BridgeFastUia.dll` 正被运行中的宿主进程占用，请先退出对应宿主进程，再重新运行 `python install.py --uninstall` 完成收尾清理。）*
+
+macOS 使用 `python3 install.py --uninstall`。
 
 运行自动化测试套件（全程使用临时 `--home-dir`，不修改任何真实宿主配置）：
 

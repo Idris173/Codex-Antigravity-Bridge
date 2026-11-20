@@ -2,7 +2,7 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-A general-purpose local MCP communication bridge between **OpenAI Codex** (ChatGPT Desktop App / Codex CLI) and **Google Antigravity** on Windows.
+A general-purpose local MCP communication bridge between **OpenAI Codex** (ChatGPT Desktop App / Codex CLI) and **Google Antigravity**. Windows supports headless and desktop window operation. This branch adds a macOS headless preview.
 
 Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://github.com/Idris173/Codex-Antigravity-Bridge)
 
@@ -14,7 +14,7 @@ Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://githu
 
 - **On-Demand & Dormant by Default**: Installed skills stay completely silent during normal chats and activate only when you explicitly ask Antigravity and Codex to collaborate or exchange messages.
 - **Dual Transport (Headless Concurrent CLI + Fast UIA)**:
-  - **Headless Multi-Session (`codex_exec`)**: Drives the bundled `codex.exe exec / resume` CLI in the background with isolated `binding_id` records—supporting multiple workspaces in parallel even when both desktop apps are minimized, with zero focus changes or clipboard writes.
+  - **Headless Multi-Session (`codex_exec`)** uses `codex exec / resume` in the background. Each binding keeps its own workspace and session.
   - **Desktop Window (`uia`)** uses Windows UI Automation to send requests to a Codex window and reads the local session log to match results by `dispatch_id`.
 - **Codex → Antigravity** sends requests and results to the local inbox through MCP. Antigravity replies using the same `request_id`.
 - **Language Auto-Matching**: English prompts keep the entire coordination loop in English; Simplified Chinese prompts keep the entire loop in Simplified Chinese.
@@ -24,16 +24,18 @@ Repository: [https://github.com/Idris173/Codex-Antigravity-Bridge](https://githu
 
 ## Requirements
 
-- **Windows 10 / 11**
+- **Windows 10 / 11** or **macOS** on this preview branch
 - **Python 3.11+** (standard library only; zero third-party packages)
 - **Google Antigravity**
-- **OpenAI ChatGPT Desktop App** (with Codex enabled)
+- **OpenAI Codex**. On macOS, install and sign in to the [Codex CLI](https://learn.chatgpt.com/docs/cli) and confirm that `codex --version` works in your terminal. You can use the Codex CLI or the ChatGPT desktop app to send bridge requests.
 
 ---
 
 ## Installation & Health Check
 
-Running `install.py` from either Antigravity or ChatGPT/Codex produces the exact same installation state (see [AGENTS.md](./AGENTS.md)):
+Run the platform's installer command from the repository root. [Installation contract](./AGENTS.md)
+
+### Windows
 
 ```powershell
 git clone https://github.com/Idris173/Codex-Antigravity-Bridge.git
@@ -42,9 +44,25 @@ python install.py
 python install.py --doctor
 ```
 
+### macOS headless preview
+
+Use a checkout of `macos-headless`. From the same terminal where `codex --version` works:
+
+```sh
+python3 install.py
+python3 install.py --doctor
+```
+
+Reopen Antigravity and your Codex client after the first install. Open the same project folder on both sides and use its absolute path, such as `/Users/you/Projects/example`.
+
+1. From Antigravity, ask it to have Codex read the project's README and explicitly allow a single result receipt. Use the headless workspace binding for this task.
+2. From Codex, ask it to send a message to Antigravity and report the reply. Antigravity can check its inbox manually. To enable automatic notifications, use the [optional notification setup](#optional-antigravity-conversation-notifications) with `python3` from the target workspace.
+
+The health check verifies the installed CLI command and both MCP connections. The POSIX tests use an isolated home and a stub Codex CLI. A full test with the live desktop clients on a Mac remains pending.
+
 What `install.py` configures non-destructively:
 
-1. Copies the bridge runtime (`bridge_server.py`, `headless_multi_engine.py`, `notify_inbox.py`, `agy_model_guard.py`, `codex_projects.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) to `~/.gemini/config/sidecars/chatgpt-bridge/` and precompiles `BridgeFastUia.dll`.
+1. Copies the Python bridge runtime to `~/.gemini/config/sidecars/chatgpt-bridge/`. On Windows it also deploys the UI Automation files and precompiles `BridgeFastUia.dll`. On macOS it records the Codex CLI path and terminal `PATH` for Antigravity's background process.
 2. Installs the on-demand skills to `~/.gemini/config/skills/codex-antigravity-bridge/` and `~/.codex/skills/codex-antigravity-bridge/`.
 3. Creates timestamped `.bak` backups before non-destructively merging `chatgpt-bridge` into `~/.gemini/config/mcp_config.json` and `[mcp_servers.antigravity_bridge]` into `~/.codex/config.toml` (preserving all existing MCP servers).
 
@@ -87,7 +105,7 @@ Runs concurrently across multiple workspaces and works even when both Antigravit
 - For read-only verification tasks that are authorized to write back one receipt, pass `"repository_read_only": true` and `"authorize_receipt": true` to `bridge_dispatch_task`.
 - Release a session binding when finished with `bridge_unbind_session(binding_id="<binding_id>")`.
 
-#### Desktop Window Mode
+#### Desktop Window Mode (Windows)
 
 Inspect open ChatGPT windows with `bridge_inspect_app()`, bind a target project or conversation via `bridge_bind_session(create_in_project="<project>", engine="general", mode="semi_auto")` or `switch_to_session="<session>"`, and send tasks with `bridge_dispatch_task(binding_id="<binding_id>", ...)`.
 
@@ -245,6 +263,8 @@ python install.py --uninstall
 ```
 
 *(If `BridgeFastUia.dll` is currently loaded by a running host process, close the host and rerun `python install.py --uninstall` to complete cleanup.)*
+
+On macOS, use `python3 install.py --uninstall`.
 
 To run the isolated test suite (uses temporary `--home-dir` directories without touching host configuration):
 

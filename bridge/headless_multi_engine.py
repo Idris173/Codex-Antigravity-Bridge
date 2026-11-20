@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 headless_multi_engine.py:
-Multi-session concurrent registry, dual-minimized headless `codex.exe exec` engine,
+Multi-session concurrent registry, headless `codex exec` engine,
 short-lived UIA injection mutex, and workspace-isolated inbox filtering for Codex-Antigravity-Bridge.
 
-Zero external third-party dependencies (Python 3.11+ standard library on Windows).
+Uses the Python 3.11+ standard library.
 """
 
 from __future__ import annotations
@@ -24,10 +24,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-try:
+if os.name == "nt":
     import msvcrt
-except ImportError:  # pragma: no cover - non-Windows fallback
-    msvcrt = None  # type: ignore[assignment]
+else:
+    import fcntl
 
 CREATE_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000 if os.name == "nt" else 0)
 
@@ -67,9 +67,19 @@ def _get_thread_lock(path: Path) -> threading.Lock:
         return lock
 
 
+def _set_file_lock(handle, *, acquire: bool) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        mode = msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK
+        msvcrt.locking(handle.fileno(), mode, 1)
+    else:
+        mode = fcntl.LOCK_EX | fcntl.LOCK_NB if acquire else fcntl.LOCK_UN
+        fcntl.flock(handle.fileno(), mode)
+
+
 @contextmanager
 def _file_mutex(path: Path, timeout_sec: float = 5.0) -> Iterator[None]:
-    """Cross-thread and cross-process short critical-section file lock using msvcrt.locking."""
+    """Serialize a critical section across threads and separate MCP processes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     t_lock = _get_thread_lock(path)
     deadline = time.monotonic() + max(0.05, float(timeout_sec))
@@ -80,25 +90,21 @@ def _file_mutex(path: Path, timeout_sec: float = 5.0) -> Iterator[None]:
 
     try:
         with path.open("a+b") as handle:
-            if msvcrt is not None:
-                while True:
-                    handle.seek(0)
-                    try:
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError:
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(f"Mutex timed out acquiring file lock: {path}") from None
-                        time.sleep(0.02)
+            while True:
+                try:
+                    _set_file_lock(handle, acquire=True)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Mutex timed out acquiring file lock: {path}") from None
+                    time.sleep(0.02)
             try:
                 yield
             finally:
-                if msvcrt is not None:
-                    handle.seek(0)
-                    try:
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
+                try:
+                    _set_file_lock(handle, acquire=False)
+                except OSError:
+                    pass
     finally:
         t_lock.release()
 
@@ -179,7 +185,7 @@ _APPX_CODEX_EXE: Optional[Path] = None
 
 def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]:
     """
-    Dynamically locate Windows OpenAI Codex CLI (`codex.exe`):
+    Locate the OpenAI Codex CLI:
     1) Explicit `codex_exe` argument or `CODEX_ANTIGRAVITY_BRIDGE_CODEX_EXE` / `CODEX_EXE` environment variable
     2) `shutil.which("codex")` or `shutil.which("codex.exe")`
     3) PowerShell `Get-AppxPackage -Name "OpenAI.Codex"` InstallLocation + `\\app\\resources\\codex.exe`
@@ -195,19 +201,24 @@ def discover_codex_exe(codex_exe: Optional[Path | str] = None) -> Optional[Path]
         if candidate:
             p = Path(candidate)
             if p.is_file():
-                return p.resolve()
+                return p.resolve() if os.name == "nt" else p.absolute()
 
-    for cmd_name in ("codex", "codex.exe"):
+    commands = ("codex", "codex.exe") if os.name == "nt" else ("codex",)
+    for cmd_name in commands:
         found = shutil.which(cmd_name)
         if found:
             p = Path(found)
             if p.is_file():
-                return p.resolve()
+                # Keep a POSIX launcher symlink usable across CLI upgrades.
+                return p.resolve() if os.name == "nt" else p.absolute()
+
+    if os.name != "nt":
+        return None
 
     global _APPX_CODEX_EXE
     if _APPX_CODEX_EXE is not None and _APPX_CODEX_EXE.is_file():
         return _APPX_CODEX_EXE
-    if os.name == "nt" and shutil.which("powershell.exe"):
+    if shutil.which("powershell.exe"):
         ps_script = (
             '(Get-AppxPackage -Name "OpenAI.Codex" '
             "| Sort-Object Version -Descending "
@@ -670,7 +681,7 @@ def _extract_event_fields(event: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 class HeadlessCodexRunner:
     """
-    True multi-session concurrent & dual-minimized execution engine powered by `codex.exe exec`.
+    Multi-session concurrent execution powered by `codex exec`.
     - Zero focus stealing, zero clipboard touching, works while both Antigravity & ChatGPT/Codex windows are minimized.
     - Non-destructive async timeout: if execution exceeds `timeout_sec`, background collector keeps running
       and writes completion state to `<base_dir>/bindings/<binding_id>.last_run.json` for `read_latest_run`.
@@ -737,7 +748,7 @@ class HeadlessCodexRunner:
             top_opts.extend(["-c", f'service_tier="{norm_speed}"'])
 
         if codex_session_id:
-            # Real codex.exe clap grammar accepts `-s` and `-C` on top-level/exec before `resume <SESSION_ID>`
+            # Codex CLI accepts `-s` and `-C` before `resume <SESSION_ID>`.
             top_opts.extend(["-s", sandbox])
             if workspace_path:
                 top_opts.extend(["-C", workspace_path])
@@ -786,7 +797,7 @@ class HeadlessCodexRunner:
                 "channel": "codex_headless_exec",
                 "dispatch_id": dispatch_id,
                 "error_code": "CODEX_EXE_NOT_FOUND",
-                "message": "未找到本机 codex.exe 可执行文件，无法使用无头引擎派发。",
+                "message": "未找到本机 Codex CLI，无法使用无头模式派发。",
             }
 
         binding_id = str(binding.get("binding_id") or "default").strip() or "default"
@@ -867,7 +878,7 @@ class HeadlessCodexRunner:
                 "binding_id": binding_id,
                 "dispatch_id": dispatch_id,
                 "error_code": "CODEX_SPAWN_ERROR",
-                "message": f"启动无头 codex.exe 失败: {exc}",
+                "message": f"启动无头 Codex CLI 失败: {exc}",
             }
 
         state_lock = threading.Lock()
@@ -1100,7 +1111,7 @@ class HeadlessCodexRunner:
                         "message": "Codex 无头引擎已完成本轮施工并返回回复。",
                     }
                 else:
-                    err_detail = last_error_msg or stderr_text[-1000:] or f"codex.exe exited with code {exit_code}"
+                    err_detail = last_error_msg or stderr_text[-1000:] or f"Codex CLI exited with code {exit_code}"
                     final_doc = {
                         "ok": False,
                         "status": "failed",
@@ -1237,7 +1248,7 @@ def filter_submissions_by_workspace(
     workspace_path: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    Case-insensitive normalized workspace path filter for review inbox submissions.
+    Normalize workspace paths using the host platform's path rules.
     Matches exact workspace directory or any nested subdirectory under `workspace_path`.
     """
     target = _normalize_fs_path(workspace_path)

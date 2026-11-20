@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -18,9 +19,12 @@ import time
 import tomllib
 from dataclasses import dataclass
 
+from bridge.headless_multi_engine import discover_codex_exe
+
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py",
-                "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py")
+WINDOWS_BRIDGE_FILES = ("uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
+CODEX_EXE_ENV = "CODEX_ANTIGRAVITY_BRIDGE_CODEX_EXE"
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
 SKILL_NAME = "codex-antigravity-bridge"
@@ -217,10 +221,19 @@ def antigravity_hook_edits(layout, python=None):
     key = "codex-antigravity-bridge-model"
     script = str(layout.bridge / "agy_model_guard.py")
     current = hooks.get(key)
-    owned = isinstance(current, dict) and any(
-        isinstance(handler, dict) and script in handler.get("command", "")
-        for handler in current.get("PreInvocation", [])
-    )
+
+    def owns_handler(handler):
+        value = handler.get("command") if isinstance(handler, dict) else None
+        if not isinstance(value, str):
+            return False
+        if os.name == "nt":
+            return script in value
+        try:
+            return script in shlex.split(value)
+        except ValueError:
+            return False
+
+    owned = isinstance(current, dict) and any(owns_handler(handler) for handler in current.get("PreInvocation", []))
     if current is not None and not owned:
         if python is None:
             return []
@@ -231,8 +244,9 @@ def antigravity_hook_edits(layout, python=None):
         del hooks[key]
     else:
         def command(action):
-            return {"type": "command", "command": subprocess.list2cmdline([str(python), "-B", script, action]),
-                    "timeout": 10}
+            argv = [str(python), "-B", script, action]
+            shell_command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+            return {"type": "command", "command": shell_command, "timeout": 10}
 
         hooks[key] = {
             "PreInvocation": [command("pre-invocation")],
@@ -457,7 +471,7 @@ def edit_toml(original, server, entry, state):
         return None
     return merged.encode("utf-8")
 
-def plans(layout, python=None):
+def plans(layout, python=None, codex_env=None):
     original_json = read_bytes(layout.check_path(layout.gemini))
     original_toml = read_bytes(layout.check_path(layout.codex))
     state_bytes = read_bytes(layout.check_path(layout.state))
@@ -471,6 +485,8 @@ def plans(layout, python=None):
         }
     entry_json = registry_entry(python, layout.server, "antigravity") if python else None
     entry_toml = registry_entry(python, layout.server, "codex") if python else None
+    if entry_json is not None and codex_env:
+        entry_json["env"] = codex_env
     return state, [
         (layout.gemini, original_json, edit_json(original_json, layout.server, entry_json, state)),
         (layout.codex, original_toml, edit_toml(original_toml, layout.server, entry_toml, state)),
@@ -486,6 +502,10 @@ def copy_file(layout, source, target):
     return True
 
 
+def bridge_files():
+    return BRIDGE_FILES + WINDOWS_BRIDGE_FILES if os.name == "nt" else BRIDGE_FILES
+
+
 def copy_assets(layout):
     for source, destination in layout.skills:
         layout.check_path(destination)
@@ -493,7 +513,7 @@ def copy_assets(layout):
             if file.is_file():
                 copy_file(layout, file, destination / file.relative_to(source))
     changed = False
-    for name in BRIDGE_FILES:
+    for name in bridge_files():
         copied = copy_file(layout, SOURCE / "bridge" / name, layout.bridge / name)
         if name == "BridgeFastUia.cs":
             changed = copied
@@ -582,14 +602,21 @@ def confirm_python(python):
 
 
 def install(layout, python, workspace=None, conversation_id=None):
-    state, edits = plans(layout, python)
+    codex_env = None
+    if os.name != "nt":
+        executable = discover_codex_exe()
+        if executable is None or not os.access(executable, os.X_OK):
+            raise ValueError("Install the Codex CLI and make codex available in this terminal, then rerun install.py.")
+        # The Antigravity app can have a different PATH from the terminal, including for npm launchers.
+        codex_env = {CODEX_EXE_ENV: str(executable), "PATH": os.environ.get("PATH", os.defpath)}
+    state, edits = plans(layout, python, codex_env)
     if conversation_id:
         edits.extend(antigravity_notification_edits(layout, python, workspace, conversation_id))
     if conversation_id or layout.antigravity_sidecar.is_file():
         edits.extend(antigravity_hook_edits(layout, python))
     confirm_python(python)
     changed = copy_assets(layout)
-    dll_ok = compile_dll(layout, changed)
+    dll_ok = compile_dll(layout, changed) if os.name == "nt" else True
     if not layout.state.exists():
         atomic_write(layout.state, json_bytes(state))
     backups = [backup for path, old, new in edits if (backup := write_config(path, old, new))]
@@ -619,7 +646,9 @@ def uninstall(layout):
         except PermissionError as error:
             raise LockedBridgeLibrary(f"UI Automation DLL: {dll}") from error
 
-    files = [bridge / name for name in (*BRIDGE_FILES, "session_lock.json", "session_lock.mutex", "director_settings.mutex")]
+    files = [bridge / name for name in (
+        *BRIDGE_FILES, *WINDOWS_BRIDGE_FILES, "session_lock.json", "session_lock.mutex", "director_settings.mutex",
+    )]
     bindings = layout.check_path(bridge / "bindings")
     files.extend(bindings / name for name in ("bindings.mutex", "ui_inject.mutex"))
     files.extend(path for path in bindings.glob("*.run.mutex") if re.fullmatch(r"[A-Za-z0-9_.-]+\.run\.mutex", path.name))
@@ -731,7 +760,7 @@ def doctor(layout):
         )
         result(f"{source.parent.name}_skill", good, path=str(destination))
 
-    script_paths = [layout.check_path(layout.bridge / file) for file in BRIDGE_FILES]
+    script_paths = [layout.check_path(layout.bridge / file) for file in bridge_files()]
     bridge_ok = all(read_bytes(path) == (SOURCE / "bridge" / path.name).read_bytes() for path in script_paths)
     result("bridge_files", bridge_ok, path=str(layout.bridge))
     if layout.antigravity_sidecar.is_file():
@@ -744,13 +773,14 @@ def doctor(layout):
             result("antigravity_model_hook", not pending_edits and enabled_hook, path=str(hooks))
         except (OSError, ValueError, KeyError, TypeError) as error:
             result("antigravity_model_hook", False, error=type(error).__name__)
-    dll = layout.check_path(layout.bridge / "BridgeFastUia.dll")
-    try:
-        run_powershell(CHECK_DLL, {"CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(dll)})
-        fresh = dll.stat().st_mtime_ns >= (layout.bridge / "BridgeFastUia.cs").stat().st_mtime_ns
-        result("uia_dll", fresh, path=str(dll))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        result("uia_dll", False, path=str(dll), error=type(error).__name__)
+    if os.name == "nt":
+        dll = layout.check_path(layout.bridge / "BridgeFastUia.dll")
+        try:
+            run_powershell(CHECK_DLL, {"CODEX_ANTIGRAVITY_BRIDGE_DLL_PATH": str(dll)})
+            fresh = dll.stat().st_mtime_ns >= (layout.bridge / "BridgeFastUia.cs").stat().st_mtime_ns
+            result("uia_dll", fresh, path=str(dll))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            result("uia_dll", False, path=str(dll), error=type(error).__name__)
 
     for config_path, loader, table, name, role in (
         (layout.gemini, load_json, "mcpServers", AGY, "antigravity"),
@@ -773,6 +803,20 @@ def doctor(layout):
         except (OSError, ValueError) as error:
             result(f"{role}_config", False, path=str(config_path), error=type(error).__name__)
             valid = False
+        if os.name != "nt" and role == "antigravity" and valid:
+            try:
+                env = configuration_map(entry, "env")
+                executable = env.get(CODEX_EXE_ENV, "")
+                if not isinstance(executable, str) or not Path(executable).is_absolute():
+                    raise ValueError("Codex CLI path is missing from the Antigravity registration. Rerun install.py.")
+                version = subprocess.run(
+                    [executable, "--version"], env={**os.environ, **env},
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+                )
+                result("codex_cli", version.returncode == 0, path=executable,
+                       version=version.stdout.strip(), error=version.stderr.strip())
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                result("codex_cli", False, error=str(error))
         if not valid:
             result(f"{role}_mcp", False, error="configuration_unavailable")
             continue
@@ -808,8 +852,8 @@ def main(argv=None):
             report["message"] = text["healthy" if report["ok"] else "unhealthy"]
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report["ok"] else 1
-        if os.name != "nt" and not args.uninstall:
-            raise ValueError("The current bridge requires Windows.")
+        if sys.platform not in ("win32", "darwin") and not args.uninstall:
+            raise ValueError("The installer supports Windows and macOS.")
         if args.uninstall:
             backups = uninstall(layout)
             print(text["removed"])

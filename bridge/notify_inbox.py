@@ -44,7 +44,7 @@ def _workspace_from_uri(uri):
     path = unquote(parts.path)
     if parts.netloc:
         path = f"//{parts.netloc}{path}"
-    elif len(path) > 2 and path[0] == "/" and path[2] == ":":
+    elif os.name == "nt" and len(path) > 2 and path[0] == "/" and path[2] == ":":
         path = path[1:]
     return bridge._existing_workspace(path)
 

@@ -5,7 +5,7 @@ Codex-Antigravity-Bridge (v2.3 Release):
 Bidirectional local MCP Server & IPC bus between Antigravity (Tech Director) and OpenAI Codex Desktop (Worker).
 - Role 'antigravity' (default): Window gatekeeper, 266ms fast UIA + 35ms lossless JSONL dispatch, and Codex inbox review tools.
 - Role 'codex' (--role codex): Native MCP submission/reply tools so Codex NEVER needs `computer-use` GUI clicking.
-Zero external third-party dependencies (standard Python 3.11+ on Windows).
+Uses the Python 3.11+ standard library. Desktop window automation is Windows-only.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import argparse
 import atexit
 import datetime as dt
 import json
-import msvcrt
 import os
 import queue
 import re
@@ -25,7 +24,6 @@ import threading
 import time
 import tomllib
 import uuid
-from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +35,7 @@ if str(BASE_DIR) not in sys.path:
 from headless_multi_engine import (  # noqa: E402
     BindingStore,
     HeadlessCodexRunner,
+    _file_mutex as _mutex,
     discover_codex_exe,
     filter_submissions_by_workspace,
     ui_inject_lock,
@@ -53,6 +52,7 @@ REQUEST_ID = re.compile(r"req_[0-9]+_[0-9a-f]{6,32}")
 DISPATCH_ID = re.compile(r"[0-9a-f]{32}")
 CONVERSATION_ID = re.compile(r"[0-9a-zA-Z-]{32,128}")
 MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,95}")
+DESKTOP_UIA_SUPPORTED = os.name == "nt"
 
 _WARM_PS_PROC: Optional[subprocess.Popen] = None
 _WARM_PS_LOCK = threading.Lock()
@@ -64,30 +64,6 @@ def _ensure_bus_dir() -> None:
 
 def _now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-@contextmanager
-def _mutex(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
-        deadline = time.monotonic() + 5.0
-        while True:
-            handle.seek(0)
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Local bridge mutex is busy") from None
-                time.sleep(0.04)
-        try:
-            yield
-        finally:
-            handle.seek(0)
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
 
 
 def _serialized_binding(func):
@@ -218,6 +194,14 @@ def _clear_lock() -> None:
     LOCK_FILE.unlink(missing_ok=True)
 
 
+def _desktop_uia_unavailable() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error_code": "DESKTOP_UIA_WINDOWS_ONLY",
+        "message": "桌面窗口操作需要 Windows。请提供工作区路径使用无头 Codex。",
+    }
+
+
 def _run_ps_driver(
     action: str,
     expected_session: str = "",
@@ -230,6 +214,8 @@ def _run_ps_driver(
     timeout_sec: int = 50,
     allow_placeholder_title: bool = False,
 ) -> Dict[str, Any]:
+    if not DESKTOP_UIA_SUPPORTED:
+        return _desktop_uia_unavailable()
     if not PS_DRIVER.exists():
         return {
             "ok": False,
@@ -665,7 +651,8 @@ def _update_first_title(lock: dict, snapshot: dict) -> Dict[str, Any]:
 
 
 def tool_inspect_app() -> Dict[str, Any]:
-    res = _run_ps_driver(action="inspect", timeout_sec=20)
+    res = _run_ps_driver(action="inspect", timeout_sec=20) if DESKTOP_UIA_SUPPORTED else {"ok": True}
+    res["desktop_uia_supported"] = DESKTOP_UIA_SUPPORTED
     store = _binding_store()
     active_bindings = store.list_bindings()
     res["current_lock"] = active_bindings[0] if len(active_bindings) == 1 else _load_lock()
@@ -788,6 +775,9 @@ def tool_bind_session(
             "message": f"已建立无头并发会话绑定: '{lock_data['session_title']}' (双端最小化与多会话并发就绪)",
             "lock": lock_data,
         }
+
+    if not DESKTOP_UIA_SUPPORTED:
+        return _desktop_uia_unavailable()
 
     try:
         with ui_inject_lock(BASE_DIR):
@@ -952,6 +942,8 @@ def tool_dispatch_task(
         return err or {"ok": False, "error_code": "SESSION_NOT_BOUND", "message": "未绑定任何会话。"}
 
     use_headless = _is_headless_binding(lock)
+    if not use_headless and not DESKTOP_UIA_SUPPORTED:
+        return _desktop_uia_unavailable()
     if not use_headless and (reply_format == "natural" or not wait_for_result):
         return {"ok": False, "error_code": "REQUIRES_HEADLESS_BINDING"}
     if reply_format == "natural" and authorize_receipt:
@@ -1130,6 +1122,8 @@ def tool_read_latest(binding_id: str = "") -> Dict[str, Any]:
 
 
 def tool_create_project_session(project_name: str, hwnd: int = 0) -> Dict[str, Any]:
+    if not DESKTOP_UIA_SUPPORTED:
+        return _desktop_uia_unavailable()
     proj = (project_name or "").strip()
     if not proj:
         return {"ok": False, "error_code": "EMPTY_PROJECT", "message": "必须指定目标工程名称 (project_name)。"}
@@ -1706,7 +1700,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
         "name": "bridge_bind_session",
         "description": (
             "多会话并发加锁与快连工具：支持无头并发引擎 (codex_exec，双端最小化可用、多工程并行) "
-            "或桌面窗口绑定 (支持 session_title / create_in_project / switch_to_session)。"
+            "或 Windows 桌面窗口绑定 (支持 session_title / create_in_project / switch_to_session)。"
         ),
         "inputSchema": {
             "type": "object",
@@ -1714,7 +1708,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "session_title": {"type": "string", "description": "当前激活会话标题。"},
                 "create_in_project": {"type": "string", "description": "一步在指定侧边栏工程下新建会话并锁定。"},
                 "switch_to_session": {"type": "string", "description": "一步切换到侧边栏已有会话并锁定。"},
-                "workspace_path": {"type": "string", "description": "本地工程路径（传入即可启用 codex.exe 无头并发与最小化支持）。"},
+                "workspace_path": {"type": "string", "description": "本地工程绝对路径，用于绑定无头 Codex。"},
                 "transport": {"type": "string", "enum": ["auto", "codex_exec", "uia"]},
                 "codex_session_id": {"type": "string", "description": "可选：续接已有的 Codex 会话 ID。"},
                 "codex_model": {"type": "string", "description": "可选：无头模式指定模型（如 gpt-6.2-sol）。"},
@@ -1732,7 +1726,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "bridge_dispatch_task",
-        "description": "向指定 binding_id 会话无阻塞并发派发指令（支持无头 codex.exe 双端最小化并发与 35ms JSONL 轮询直连）。",
+        "description": "向指定 binding_id 派发任务，支持无头 Codex 并发和异步结果。",
         "inputSchema": {
             "type": "object",
             "properties": {

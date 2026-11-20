@@ -31,6 +31,8 @@ description: >-
 
 首次调用懒加载 MCP 工具前，按需读取 `<appDataDir>/mcp/chatgpt-bridge/*.json` Schema：
 
+在 macOS 上，用项目的绝对路径和 `transport="codex_exec"` 绑定 Codex。需要续接时传 `reuse_workspace_binding=true`。下方通过窗口标题或侧边栏操作来绑定会话的步骤适用于 Windows。
+
 ### 路径 A：制作人未指明具体会话时（先探后锁）
 1. 调用 `bridge_inspect_app` 获取当前打开会话与侧边栏工程/会话列表；
 2. 向制作人展示候选会话 + **3~5 行微缩 Spec** + 确认模式（`半自动把关` / `目标托管`）；
@@ -38,7 +40,7 @@ description: >-
 
 ### 路径 B：制作人已明确指定「在某工程新建会话」、「切到某已有会话」或「多会话/双端最小化并发」时（一步快连）
 - 与制作人确认需求无误后，直接调用一次 `bridge_bind_session`：
-  - **多会话并行 / 双端最小化无感模式（推荐本地工程使用）**：传 `workspace_path="<本地工程绝对路径>", transport="codex_exec"`（可选传 `codex_model`、`codex_effort`、`codex_speed`，默认自动继承 `bridge_routing_settings` 保存的施工选型），直接通过内置无头 `codex.exe exec / resume` 运行，即使反重力与 ChatGPT 桌面端全部最小化、或多工程同时施工也零冲突；
+  - **无头多会话模式**传 `workspace_path="<本地工程绝对路径>", transport="codex_exec"`。可指定 `codex_model`、`codex_effort`、`codex_speed`，默认沿用 `bridge_routing_settings` 保存的选型。任务通过 `codex exec / resume` 在后台运行。
   - 新建窗口工程会话传：`create_in_project="<工程名>"`；
   - 切换窗口已有会话传：`switch_to_session="<会话名>"`；
 - 一步原子完成加锁并记录专属 `binding_id`，随后携带该 `binding_id` 调用 `bridge_dispatch_task`。

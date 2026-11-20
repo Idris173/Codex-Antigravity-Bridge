@@ -353,7 +353,123 @@ class MergeAndLocaleTests(TemporaryHomeTest):
             self.assertEqual(install.detect_language("zh"), "zh")
 
 
-@unittest.skipUnless(os.name == "nt", "The bridge uses the Windows file mutex")
+@unittest.skipUnless(os.name == "posix", "Requires a POSIX shell and file locks")
+class PosixInstallerAndBusTests(TemporaryHomeTest):
+    def test_headless_install_doctor_and_bidirectional_mcp(self):
+        home = self.layout.home / "home with ' quote"
+        home.mkdir()
+        self.layout = install.Layout(home)
+        workspace = home / "example workspace"
+        workspace.mkdir()
+        launcher = home / "bin" / "codex"
+        cli = launcher.with_name("codex-native")
+        self.seed(cli, b"""#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf '%s\\n' 'codex-cli test'
+    exit 0
+fi
+printf '%s\\n' '{"type":"thread.started","thread_id":"test-thread"}'
+printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Read-only check finished."}}'
+printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+""")
+        cli.chmod(0o755)
+        launcher.symlink_to(cli.name)
+        agentapi = launcher.with_name("agentapi")
+        self.seed(agentapi, b"""#!/bin/sh
+[ "$1" = send-message ] || exit 2
+printf '{"response":{"sendMessage":{"recipientId":"%s"}}}\\n' "$2"
+""")
+        agentapi.chmod(0o755)
+        self.seed(self.layout.gemini, b'{"mcpServers":{"existing":{"command":"keep-this"}}}')
+        shell_path = str(launcher.parent) + os.pathsep + os.defpath
+        overrides = {key: "" for key in (install.CODEX_EXE_ENV, "CODEX_DIRECTOR_CODEX_EXE", "CODEX_EXE")}
+        cid = "12345678-1234-1234-1234-123456789abc"
+        with mock.patch.dict(os.environ, {**overrides, "PATH": shell_path}):
+            with (
+                mock.patch.object(sys, "platform", "darwin"),
+                mock.patch.object(Path, "cwd", return_value=workspace),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(install.main(["--home-dir", str(home), "--agy-conversation-id", cid, "--lang", "en"]), 0)
+        self.assertTrue(all(not (self.layout.bridge / file).exists() for file in install.WINDOWS_BRIDGE_FILES))
+        installed = json.loads(self.layout.gemini.read_text(encoding="utf-8"))["mcpServers"]
+        self.assertEqual(installed["existing"]["command"], "keep-this")
+        agy_entry = installed[install.AGY]
+        self.assertEqual(agy_entry["env"][install.CODEX_EXE_ENV], str(launcher))
+        self.assertEqual(agy_entry["env"]["PATH"], shell_path)
+        codex_entry = tomllib.loads(self.layout.codex.read_text(encoding="utf-8"))["mcp_servers"][install.CODEX]
+
+        with mock.patch.dict(os.environ, {"PATH": os.defpath}):
+            health = install.doctor(self.layout)
+            self.assertTrue(health["ok"], health)
+            self.assertEqual(health["checks"]["codex_cli"]["version"], "codex-cli test")
+            self.assertNotIn("uia_dll", health["checks"])
+            inspection = self.tool(agy_entry, install.AGY, "bridge_inspect_app", {})
+            self.assertFalse(inspection["desktop_uia_supported"])
+            self.assertTrue(inspection["headless_codex_available"])
+            rejected = install.exchange_mcp(agy_entry, install.AGY, "tools/call", {
+                "name": "bridge_bind_session", "arguments": {"transport": "uia"},
+            })
+            self.assertTrue(rejected["isError"])
+            self.assertEqual(json.loads(rejected["content"][0]["text"])["error_code"], "DESKTOP_UIA_WINDOWS_ONLY")
+            binding = self.tool(agy_entry, install.AGY, "bridge_bind_session", {"workspace_path": str(workspace)})
+            dispatched = self.tool(agy_entry, install.AGY, "bridge_dispatch_task", {
+                "binding_id": binding["binding_id"], "step_goal": "Check project", "task_instruction": "Read only.",
+                "repository_read_only": True,
+            })
+            self.assertTrue(dispatched["ok"], dispatched)
+            self.assertEqual(dispatched["raw_reply"], "Read-only check finished.")
+
+            submitted = self.tool(codex_entry, install.CODEX, "agy_submit_for_review", {
+                "step_summary": "Review headless result", "workspace_path": str(workspace), "wait_for_reply": False,
+            })
+            request_id = submitted["request_id"]
+            manifest = json.loads(self.layout.antigravity_sidecar.read_text(encoding="utf-8"))
+            notification = subprocess.run(
+                [PYTHON, "-B", "-c", "import sys; from notify_inbox import notify_pending; "
+                 "notify_pending(sys.argv[1], sys.argv[2], int(sys.argv[3]), 'agentapi')", *manifest["args"][2:]],
+                cwd=self.layout.bridge, env={**os.environ, "PATH": shell_path},
+                capture_output=True, text=True, check=True, timeout=15,
+            )
+            self.assertIn(request_id, notification.stdout)
+            pending = self.tool(agy_entry, install.AGY, "bridge_check_codex_inbox", {"request_id": request_id})
+            self.assertEqual(pending["submission"]["step_summary"], "Review headless result")
+            replied = self.tool(agy_entry, install.AGY, "bridge_reply_to_codex", {
+                "request_id": request_id, "decision": "APPROVED", "review_feedback": "Verified.",
+            })
+            self.assertTrue(replied["ok"], replied)
+            receipt = self.tool(codex_entry, install.CODEX, "agy_fetch_director_reply", {"request_id": request_id})
+            self.assertEqual(receipt["review_feedback"], "Verified.")
+
+        hooks = json.loads(self.layout.antigravity_config.with_name("hooks.json").read_text(encoding="utf-8"))
+        hook = hooks["codex-antigravity-bridge-model"]["PreInvocation"][0]["command"]
+        call = subprocess.run(["/bin/sh", "-c", hook], input=json.dumps({"conversationId": cid}),
+                              capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(call.stdout), {})
+        self.assertEqual(install.antigravity_hook_edits(self.layout, Path(PYTHON)), [])
+
+        install.uninstall(self.layout)
+        self.assertFalse(self.layout.server.exists())
+        self.assertEqual(json.loads(self.layout.gemini.read_text(encoding="utf-8"))["mcpServers"],
+                         {"existing": {"command": "keep-this"}})
+
+    def test_file_mutex_serializes_separate_processes(self):
+        from bridge.headless_multi_engine import _file_mutex
+
+        path = self.layout.home / "request.mutex"
+        program = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "from bridge.headless_multi_engine import _file_mutex\n"
+            "with _file_mutex(Path(sys.argv[1]), timeout_sec=0.05): pass\n"
+        )
+        argv = [PYTHON, "-B", "-c", program, str(path)]
+        with _file_mutex(path):
+            blocked = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=5)
+        self.assertIn("Mutex timed out acquiring file lock", blocked.stderr)
+        subprocess.run(argv, cwd=ROOT, check=True, timeout=5)
+
+
 class BridgeLogicTests(TemporaryHomeTest):
     def setUp(self):
         super().setUp()
@@ -676,8 +792,9 @@ class BridgeLogicTests(TemporaryHomeTest):
         self.assertEqual(inbox["oldest_pending"]["request_id"], first_id)
         self.assertEqual(inbox["latest_pending"]["request_id"], second_id)
         self.assertEqual([item["step_summary"] for item in inbox["pending_summaries"]], ["One", "Two"])
+        spelling = "tWO" if os.name == "nt" else "Two"
         filtered = self.bridge._dispatch_mcp_tool("antigravity", "bridge_check_codex_inbox", {
-            "workspace_path": str(self.layout.home / "nested" / ".." / "tWO")
+            "workspace_path": str(self.layout.home / "nested" / ".." / spelling)
         })
         self.assertEqual(filtered["pending_request_ids"], [second_id])
         with mock.patch.object(self.bridge, "_run_ps_driver", return_value={"ok": True}):
@@ -791,6 +908,7 @@ class BridgeLogicTests(TemporaryHomeTest):
         self.assertEqual(result["summary"], "actual reply")
         self.assertFalse(result["has_open_questions"])
 
+    @unittest.skipUnless(os.name == "nt", "Requires Windows desktop window binding")
     def test_minimized_binding_and_authoritative_first_title(self):
         snapshot = {"active_session": "我们应该在这个项目中做什么", "is_minimized": True, "hwnd": 9, "pid": 20}
         with mock.patch.object(self.bridge, "_run_ps_driver", return_value={"ok": True, "snapshot": snapshot}):
@@ -824,6 +942,7 @@ class BridgeLogicTests(TemporaryHomeTest):
         finally:
             ready.set()
 
+    @unittest.skipUnless(os.name == "nt", "Requires Windows desktop window automation")
     def test_uncertain_daemon_actions_are_never_replayed(self):
         for action in ("dispatch", "new_project_session", "switch_session"):
             for ack in ("", '{"daemon_ack":false,"error":"failure"}', '{"daemon_ack":true}'):
@@ -850,6 +969,7 @@ class BridgeLogicTests(TemporaryHomeTest):
         warm.kill.assert_called_once()
         self.assertEqual((result["error_code"], result["dispatch_id"]), ("DAEMON_EXEC_UNCERTAIN", "timed-out"))
 
+    @unittest.skipUnless(os.name == "nt", "Requires Windows desktop window automation")
     def test_read_only_driver_can_retry_daemon_failure(self):
         def cold_driver(cmd, **kwargs):
             output = Path(cmd[cmd.index("-OutputFile") + 1])

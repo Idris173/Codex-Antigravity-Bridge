@@ -510,11 +510,16 @@ class HeadlessMultiSessionMinimizedTests(unittest.TestCase):
         self.assertTrue(rm_all["ok"])
         self.assertFalse(self.store.legacy_lock_path.exists())
 
-        # Verify workspace inbox routing (case-insensitive, slash-agnostic, subdirectory-aware, prefix-safe)
+        # Verify workspace inbox routing using the platform's path rules.
         ws_a_sibling = self.root / "Workspace_Unreal_A_Other"
+        root_spelling = str(self.ws_a)
+        child_spelling = str(self.ws_a / "Source" / "Combat")
+        if os.name == "nt":
+            root_spelling = root_spelling.lower().replace("\\", "/")
+            child_spelling = child_spelling.upper()
         submissions = [
-            {"request_id": "req_1", "workspace_path": str(self.ws_a).lower().replace("\\", "/") + "/"},
-            {"request_id": "req_2", "workspace_path": str(self.ws_a / "Source" / "Combat").upper()},
+            {"request_id": "req_1", "workspace_path": root_spelling + "/"},
+            {"request_id": "req_2", "workspace_path": child_spelling},
             {"request_id": "req_3", "workspace_path": str(ws_a_sibling)},
             {"request_id": "req_4", "workspace_path": str(self.ws_b)},
             {"request_id": "req_5", "workspace_path": ""},
