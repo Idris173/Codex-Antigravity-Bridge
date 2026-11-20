@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Continue"
+﻿$ErrorActionPreference = "Stop"
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
@@ -15,6 +15,7 @@ if (Test-Path $dllPath) {
 }
 
 $driverPath = Join-Path $PSScriptRoot "uia_driver.ps1"
+$loadedDllTicks = if (Test-Path $dllPath) { (Get-Item $dllPath).LastWriteTimeUtc.Ticks } else { [long]0 }
 
 while ($true) {
     $line = [Console]::In.ReadLine()
@@ -29,6 +30,7 @@ while ($true) {
             Action     = [string]$req.action
             OutputFile = [string]$req.output_file
             TimeoutSec = if ($req.timeout_sec) { [int]$req.timeout_sec } else { 180 }
+            AllowPlaceholderTitle = [bool]$req.allow_placeholder_title
         }
         if ($req.expected_session) { $splat["ExpectedSession"] = [string]$req.expected_session }
         if ($req.project_name)     { $splat["ProjectName"]     = [string]$req.project_name }
@@ -41,9 +43,12 @@ while ($true) {
         & $driverPath @splat *> $null
         [Console]::Out.WriteLine('{"daemon_ack":true}')
         [Console]::Out.Flush()
+        if ((Test-Path $dllPath) -and ((Get-Item $dllPath).LastWriteTimeUtc.Ticks -ne $loadedDllTicks)) {
+            break
+        }
     } catch {
-        $errMsg = $_.Exception.Message -replace '["\r\n]', ' '
-        [Console]::Out.WriteLine("{`"daemon_ack`":false,`"error`":`"$errMsg`"}")
+        $failure = @{ daemon_ack = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+        [Console]::Out.WriteLine($failure)
         [Console]::Out.Flush()
     }
 }

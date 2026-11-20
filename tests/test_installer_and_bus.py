@@ -1,13 +1,16 @@
 """Isolated installer, MCP transport, and review bus tests."""
 
+import io
 import json
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 from unittest import mock
@@ -123,6 +126,17 @@ name = "Existing"
                 envelope = module["build_director_envelope"]("general", prompt, prompt)
                 self.assertIn(f"\n[LANG: {language}]\n", envelope)
 
+        routing_args = {"codex_home": str(self.layout.codex.parent)}
+        configured = self.tool(worker, install.CODEX, "agy_routing_settings", {
+            **routing_args, "action": "set", "worker_model": "gpt-6.2-sol", "worker_speed": "ultrafast"
+        })
+        director_routing = self.tool(director, install.AGY, "bridge_routing_settings", routing_args)
+        self.assertEqual(director_routing["settings"], configured["settings"])
+        self.assertEqual(director_routing["codex_current_defaults"]["model"], "friend-model")
+        self.cli()
+        self.assertEqual(self.tool(director, install.AGY, "bridge_routing_settings", routing_args)["settings"],
+                         configured["settings"])
+
         queued = self.tool(worker, install.CODEX, "agy_submit_for_review",
                            {"step_summary": "验收双边链路", "wait_for_reply": False})
         request_id = queued["request_id"]
@@ -141,7 +155,8 @@ name = "Existing"
         self.cli("--uninstall")
         self.assertEqual(json.loads(self.layout.gemini.read_bytes()), gemini)
         self.assertEqual(tomllib.loads(self.layout.codex.read_text(encoding="utf-8")), codex)
-        self.assertFalse(self.layout.bridge.exists())
+        self.assertEqual(json.loads((self.layout.bridge / "director_settings.json").read_bytes()), configured["settings"])
+        self.assertEqual(list(self.layout.bridge.iterdir()), [self.layout.bridge / "director_settings.json"])
         self.assertTrue(all(not destination.exists() for _, destination in self.layout.skills))
         self.cli("--uninstall")
         self.assertEqual(json.loads(self.layout.gemini.read_bytes()), gemini)
@@ -189,8 +204,66 @@ name = "Existing"
         self.assertEqual(dll.read_bytes(), original)
         self.assertFalse(list(self.layout.bridge.glob(".compile-*")))
 
+    def test_warm_driver_keeps_invalid_window_target_across_actions(self):
+        self.cli()
+        module = runpy.run_path(str(self.layout.server))
+        driver = module["_run_ps_driver"]
+        try:
+            for action in ("inspect", "dispatch", "read_latest", "new_project_session", "switch_session"):
+                with self.subTest(action=action):
+                    result = driver(action, target_hwnd=-1, timeout_sec=2, allow_placeholder_title=True)
+                    self.assertEqual(result["error_code"], "TARGET_WINDOW_NOT_FOUND", result)
+                    self.assertEqual(result["hwnd"], -1)
+                    warm = driver.__globals__["_WARM_PS_PROC"]
+                    self.assertIsNotNone(warm)
+                    self.assertIsNone(warm.poll())
+        finally:
+            module["_close_warm_ps"]()
+
 
 class MergeAndLocaleTests(TemporaryHomeTest):
+    def test_uninstall_keeps_custom_files_and_completes_after_unlock(self):
+        _, edits = install.plans(self.layout, Path(PYTHON))
+        for path, _, updated in edits:
+            self.seed(path, updated)
+        self.seed(self.layout.state, install.json_bytes({
+            "gemini_existed": False, "gemini_map_existed": False,
+            "codex_existed": False, "codex_map_existed": False,
+        }))
+        (self.layout.bridge / "director_settings.json").write_text("{}", encoding="utf-8")
+        install.copy_assets(self.layout)
+        dll = self.layout.bridge / "BridgeFastUia.dll"
+        self.seed(dll, b"fixture")
+        director, worker = [destination for _, destination in self.layout.skills]
+        extras = [director / "references/custom.md", worker / "custom.md",
+                  self.layout.bridge / "custom.py", self.layout.bridge / "bus/requests/custom.json"]
+        for path in extras:
+            self.seed(path, b"user data")
+
+        unlink = Path.unlink
+
+        def locked(path, *args, **kwargs):
+            if path == dll:
+                raise PermissionError("fixture physically locks DLL")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", locked):
+            with self.assertRaisesRegex(PermissionError, "BridgeFastUia.dll"):
+                install.uninstall(self.layout)
+        self.assertTrue(self.layout.state.is_file())
+        self.assertTrue(self.layout.server.is_file())
+        self.assertTrue(self.layout.codex.is_file())
+        self.assertTrue(dll.is_file())
+
+        install.uninstall(self.layout)
+        for path in (self.layout.state, self.layout.server, self.layout.codex, self.layout.gemini,
+                     dll, director / "SKILL.md", worker / "SKILL.md"):
+            self.assertFalse(path.exists(), path)
+        for path in extras:
+            self.assertEqual(path.read_bytes(), b"user data")
+        self.assertEqual((self.layout.bridge / "director_settings.json").read_text(encoding="utf-8"), "{}")
+        self.assertEqual(install.uninstall(self.layout), [])
+
     def test_inline_toml_parent_and_quoted_managed_tables(self):
         command = str(self.layout.server)
         python = Path(PYTHON)
@@ -204,13 +277,17 @@ class MergeAndLocaleTests(TemporaryHomeTest):
             '[mcp_servers."sample.dot"]\ncommand = "keep"\n'
             '[mcp_servers."antigravity_bridge"] # from an earlier install\n'
             'command = "old"\nargs = ' + install.toml_value(existing[install.CODEX]["args"]) + '\n'
-            '[mcp_servers."antigravity_bridge"."env"]\nPYTHONUTF8 = "0"\nEXISTING = "keep"\n'
+            '"A.B" = "keep top level"\n'
+            '[mcp_servers."antigravity_bridge"."env"]\nPYTHONUTF8 = "0"\nEXISTING = "keep"\n"A.B" = "keep env"\n'
         )
         for source in (inline, quoted):
             with self.subTest(source=source.splitlines()[0]):
                 original = tomllib.loads(source)
                 updated = install.edit_toml(source.encode(), self.layout.server, entry, {})
                 self.assertIn(b"[mcp_servers.antigravity_bridge.env]", updated)
+                if source == quoted:
+                    self.assertIn(b'"A.B" = "keep top level"', updated)
+                    self.assertIn(b'"A.B" = "keep env"', updated)
                 parsed = tomllib.loads(updated.decode())
                 previous = original["mcp_servers"].pop(install.CODEX)
                 expected_entry = {**previous, **entry, "env": {**previous.get("env", {}), **entry["env"]}}
@@ -233,6 +310,193 @@ class MergeAndLocaleTests(TemporaryHomeTest):
         with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8"}, clear=True):
             self.assertEqual(install.detect_language(), "en")
             self.assertEqual(install.detect_language("zh"), "zh")
+
+
+@unittest.skipUnless(os.name == "nt", "The bridge uses the Windows file mutex")
+class BridgeLogicTests(TemporaryHomeTest):
+    def setUp(self):
+        super().setUp()
+        from bridge import bridge_server
+        self.bridge = bridge_server
+        bridge_dir = self.layout.bridge
+        bus = bridge_dir / "bus"
+        patches = mock.patch.multiple(bridge_server, BASE_DIR=bridge_dir, BUS_DIR=bus,
+                                      TO_AGY_FILE=bus / "to_antigravity.json",
+                                      LATEST_TO_CODEX_FILE=bus / "to_codex_latest.json",
+                                      LOCK_FILE=bridge_dir / "session_lock.json")
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def test_routing_catalog_reads_isolated_cache_and_persists_profiles(self):
+        home = self.layout.codex.parent
+        get = {"codex_home": str(home)}
+        fallback = self.bridge._dispatch_mcp_tool("codex", "agy_routing_settings", get)
+        self.assertTrue(fallback["settings"]["ask_model_roles_on_plan"])
+        self.assertFalse((self.layout.bridge / "director_settings.json").exists())
+        self.assertEqual([tier["id"] for tier in fallback["codex_catalog"][0]["speed_tiers"]],
+                         ["standard", "fast", "ultrafast"])
+        self.assertNotIn("[ROUTING:", self.bridge.build_director_envelope("general", "goal", "instructions"))
+        self.seed(self.layout.codex, b'model = "gpt-6.2-sol"\nmodel_reasoning_effort = "high"\nservice_tier = "ultrafast"\n')
+        cache = {"models": [
+            {"slug": "slow", "visibility": "list", "priority": 4, "additional_speed_tiers": ["unknown"]},
+            {"slug": "hidden", "visibility": "hide", "priority": 0},
+            {"slug": "gpt-6.2-sol", "display_name": "GPT-6.2-Sol", "visibility": "list", "priority": 1,
+             "description": "General purpose",
+             "default_reasoning_level": "low", "supported_reasoning_levels": [{"effort": "xhigh"}, {"effort": "ultra"}],
+             "additional_speed_tiers": ["default", "fast"],
+             "service_tiers": [{"id": "priority", "description": "2x speed"},
+                               {"id": "ultrafast", "description": "The fastest available responses for latency-sensitive work."}]},
+        ]}
+        self.seed(home / "models_cache.json", json.dumps(cache).encode())
+        configured = self.bridge._dispatch_mcp_tool("antigravity", "bridge_routing_settings", {
+            **get, "action": "set", "ask_model_roles_on_plan": False, "decision_side": "codex",
+            "decision_model": "gpt-6.2-sol", "decision_effort": "ultra", "decision_speed": "ultrafast",
+            "worker_side": "antigravity", "worker_model": "gemini-4-carbon", "worker_effort": "medium",
+            "worker_speed": "priority",
+        })
+        observed = self.bridge._dispatch_mcp_tool("codex", "agy_routing_settings", get)
+        self.assertEqual(configured, observed)
+        self.assertEqual(configured["settings"], json.loads((self.layout.bridge / "director_settings.json").read_bytes()))
+        self.assertFalse(configured["settings"]["ask_model_roles_on_plan"])
+        self.assertEqual(configured["codex_current_defaults"], {
+            "model": "gpt-6.2-sol", "model_reasoning_effort": "high", "service_tier": "ultrafast",
+        })
+        sol, slow = configured["codex_catalog"]
+        self.assertEqual([sol["slug"], slow["slug"]], ["gpt-6.2-sol", "slow"])
+        self.assertEqual(sol["efforts"], ["xhigh", "ultra"])
+        self.assertEqual([(tier["id"], tier["label"]) for tier in sol["speed_tiers"]],
+                         [("standard", "标准"), ("fast", "快速"), ("ultrafast", "超快")])
+        self.assertEqual(sol["speed_tiers"][1]["description"], "2x speed")
+        self.assertEqual([tier["id"] for tier in slow["speed_tiers"]], ["standard"])
+        self.assertEqual(len(configured["antigravity_catalog"]["models"]), 8)
+        self.assertIn('swarm(action="models", all=true)', configured["antigravity_catalog"]["quota_hint"])
+        self.assertIn("[ROUTING: decision=codex:gpt-6.2-sol(effort=ultra,speed=ultrafast) | "
+                      "worker=antigravity:gemini-4-carbon(effort=medium,speed=fast)]",
+                      self.bridge.build_director_envelope("general", "goal", "instructions"))
+        self.assertIn("[ROUTING: explicit]", self.bridge.build_director_envelope(
+            "general", "goal", "instructions", routing_tag="explicit"))
+        self.assertEqual(self.bridge._dispatch_mcp_tool("codex", "agy_routing_settings", {
+            **get, "action": "set", "worker_side": "unknown"
+        })["error_code"], "INVALID_ARGUMENTS")
+
+    def test_multiple_review_requests_require_id_and_can_be_filtered(self):
+        self.assertEqual(self.bridge.tool_reply_to_codex()["error_code"], "NO_PENDING_REQUESTS")
+        first_id, second_id = "req_1_aaaaaa", "req_2_bbbbbb"
+        for req_id, directory, submitted_at in ((first_id, "One", "2026-01-01"),
+                                               (second_id, "Two", "2026-01-02")):
+            self.seed(self.bridge.BUS_DIR / "requests" / f"{req_id}.json", json.dumps({
+                "request_id": req_id, "status": "pending", "workspace_path": str(self.layout.home / directory),
+                "step_summary": directory, "submitted_at": submitted_at,
+            }).encode())
+        inbox = self.bridge.tool_check_codex_inbox()
+        self.assertEqual(inbox["oldest_pending"]["request_id"], first_id)
+        self.assertEqual(inbox["latest_pending"]["request_id"], second_id)
+        self.assertEqual([item["step_summary"] for item in inbox["pending_summaries"]], ["One", "Two"])
+        filtered = self.bridge._dispatch_mcp_tool("antigravity", "bridge_check_codex_inbox", {
+            "workspace_path": str(self.layout.home / "nested" / ".." / "tWO")
+        })
+        self.assertEqual(filtered["pending_request_ids"], [second_id])
+        with mock.patch.object(self.bridge, "_run_ps_driver", return_value={"ok": True}):
+            self.assertEqual(self.bridge.tool_inspect_app()["pending_codex_inbox"]["latest_pending"]["request_id"], second_id)
+        self.assertEqual(self.bridge.tool_reply_to_codex()["error_code"], "AMBIGUOUS_PENDING_REQUESTS")
+        invalid = self.bridge.tool_reply_to_codex("req_3_cccccc")
+        self.assertEqual(invalid["error_code"], "UNKNOWN_REQUEST_ID")
+        self.assertFalse(self.bridge._reply_path("req_3_cccccc").exists())
+        self.assertTrue(self.bridge.tool_reply_to_codex(second_id)["ok"])
+        self.assertTrue(self.bridge.tool_reply_to_codex(second_id)["already_replied"])
+        self.assertEqual(self.bridge.tool_reply_to_codex(second_id, "REWORK_REQUIRED")["error_code"], "ALREADY_REPLIED")
+        self.assertEqual(self.bridge.tool_reply_to_codex()["reply"]["request_id"], first_id)
+
+    def test_wait_only_new_skips_initial_requests(self):
+        old = {"request_id": "req_1_aaaaaa"}
+        new = {"request_id": "req_2_bbbbbb"}
+        stdout = io.StringIO()
+        with mock.patch.object(self.bridge, "_pending_submissions", side_effect=[[old], [old, new]]), redirect_stdout(stdout):
+            self.bridge.run_cli(["wait_inbox", "--only-new"])
+        self.assertEqual(json.loads(stdout.getvalue())["submission"], new)
+
+    def test_protocol_does_not_parse_echo_or_inline_tags(self):
+        echo = self.bridge.build_director_envelope("general", "goal", "instructions\n[SUMMARY]\n[FILES]")
+        self.assertFalse(self.bridge.parse_worker_reply(echo)["structured_protocol_matched"])
+        self.assertFalse(self.bridge.parse_worker_reply("Echo mentioning [SUMMARY] and [FILES]")["structured_protocol_matched"])
+        reply = echo + "\r\n## [SUMMARY]\r\nactual reply\r\n[FILES]\r\nbridge/bridge_server.py\r\n[OPEN_QUESTIONS]\r\nNONE\r\n"
+        result = self.bridge.parse_worker_reply(reply)
+        self.assertTrue(result["structured_protocol_matched"])
+        self.assertEqual(result["summary"], "actual reply")
+        self.assertFalse(result["has_open_questions"])
+
+    def test_minimized_binding_and_authoritative_first_title(self):
+        snapshot = {"active_session": "我们应该在这个项目中做什么", "is_minimized": True, "hwnd": 9, "pid": 20}
+        with mock.patch.object(self.bridge, "_run_ps_driver", return_value={"ok": True, "snapshot": snapshot}):
+            bound = self.bridge.tool_bind_session(create_in_project="Sample", hwnd=9)
+        self.assertTrue(bound["lock"]["awaiting_first_title"])
+        with mock.patch.object(self.bridge, "_run_ps_driver", return_value={
+            "ok": False, "timed_out": True, "title_authoritative": False, "active_session": "内容预览"
+        }) as driver:
+            dispatched = self.bridge.tool_dispatch_task("goal", "instructions")
+        self.assertTrue(dispatched["ok"])
+        self.assertTrue(dispatched["timed_out"])
+        self.assertFalse(dispatched["reply_confirmed"])
+        self.assertTrue(driver.call_args.kwargs["allow_placeholder_title"])
+        self.assertTrue(self.bridge._load_lock()["awaiting_first_title"])
+
+        with mock.patch.object(self.bridge, "_run_ps_driver", return_value={
+            "ok": True, "snapshot": {"active_session": "真实标题", "title_authoritative": True}
+        }):
+            self.bridge.tool_read_latest()
+        updated = self.bridge._load_lock()
+        self.assertFalse(updated["awaiting_first_title"])
+        self.assertEqual(updated["session_title"], "真实标题")
+
+    def test_daemon_ack_reader_has_bounded_wait(self):
+        ready = threading.Event()
+        stdout = mock.Mock()
+        stdout.readline.side_effect = lambda: ready.wait(2) and '{"daemon_ack":true}'
+        try:
+            with self.assertRaises(TimeoutError):
+                self.bridge._read_daemon_ack(stdout, 0.01)
+        finally:
+            ready.set()
+
+    def test_uncertain_daemon_actions_are_never_replayed(self):
+        for action in ("dispatch", "new_project_session", "switch_session"):
+            for ack in ("", '{"daemon_ack":false,"error":"failure"}', '{"daemon_ack":true}'):
+                with self.subTest(action=action, ack=ack):
+                    warm = mock.Mock(stdin=mock.Mock(), stdout=io.StringIO(ack))
+                    with mock.patch.object(self.bridge, "_WARM_PS_PROC", warm), \
+                         mock.patch.object(self.bridge, "_get_warm_ps", return_value=warm), \
+                         mock.patch.object(self.bridge.subprocess, "run") as cold:
+                        result = self.bridge._run_ps_driver(action, dispatch_id="original")
+                    cold.assert_not_called()
+                    warm.stdin.write.assert_called_once()
+                    warm.kill.assert_called_once()
+                    self.assertEqual(result["error_code"], "DAEMON_EXEC_UNCERTAIN")
+                    self.assertEqual(result["dispatch_id"], "original")
+
+        warm = mock.Mock(stdin=mock.Mock(), stdout=io.StringIO())
+        with mock.patch.object(self.bridge, "_WARM_PS_PROC", warm), \
+             mock.patch.object(self.bridge, "_get_warm_ps", return_value=warm), \
+             mock.patch.object(self.bridge, "_read_daemon_ack", side_effect=TimeoutError) as read_ack, \
+             mock.patch.object(self.bridge.subprocess, "run") as cold:
+            result = self.bridge._run_ps_driver("dispatch", dispatch_id="timed-out", timeout_sec=7)
+        read_ack.assert_called_once_with(warm.stdout, 22)
+        cold.assert_not_called()
+        warm.kill.assert_called_once()
+        self.assertEqual((result["error_code"], result["dispatch_id"]), ("DAEMON_EXEC_UNCERTAIN", "timed-out"))
+
+    def test_read_only_driver_can_retry_daemon_failure(self):
+        def cold_driver(cmd, **kwargs):
+            output = Path(cmd[cmd.index("-OutputFile") + 1])
+            output.write_text('{"ok":true}', encoding="utf-8")
+
+        for action in ("inspect", "read_latest"):
+            warm = mock.Mock(stdin=mock.Mock(), stdout=io.StringIO())
+            with mock.patch.object(self.bridge, "_WARM_PS_PROC", warm), \
+                 mock.patch.object(self.bridge, "_get_warm_ps", return_value=warm), \
+                 mock.patch.object(self.bridge.subprocess, "run", side_effect=cold_driver) as cold:
+                self.assertEqual(self.bridge._run_ps_driver(action), {"ok": True})
+            warm.kill.assert_called_once()
+            cold.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -5,21 +5,25 @@ chatgpt-bridge / antigravity_bridge (v2.3 Release):
 Bidirectional local MCP Server & IPC bus between Antigravity (Tech Director) and OpenAI Codex Desktop (Worker).
 - Role 'antigravity' (default): Window gatekeeper, 266ms fast UIA + 35ms lossless JSONL dispatch, and Codex inbox review tools.
 - Role 'codex' (--role codex): Native MCP submission/reply tools so Codex NEVER needs `computer-use` GUI clicking.
-Zero external third-party dependencies (standard Python 3.10+ on Windows).
+Zero external third-party dependencies (standard Python 3.11+ on Windows).
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
 import json
 import msvcrt
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tomllib
 import uuid
 from contextlib import contextmanager
 from functools import wraps
@@ -27,6 +31,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from headless_multi_engine import (  # noqa: E402
+    BindingStore,
+    HeadlessCodexRunner,
+    discover_codex_exe,
+    filter_submissions_by_workspace,
+    ui_inject_lock,
+)
+
 PS_DRIVER = BASE_DIR / "uia_driver.ps1"
 PS_DAEMON = BASE_DIR / "uia_daemon.ps1"
 LOCK_FILE = BASE_DIR / "session_lock.json"
@@ -36,6 +51,7 @@ LATEST_TO_CODEX_FILE = BUS_DIR / "to_codex_latest.json"
 REQUEST_ID = re.compile(r"req_[0-9]+_[0-9a-f]{6,32}")
 
 _WARM_PS_PROC: Optional[subprocess.Popen] = None
+_WARM_PS_LOCK = threading.Lock()
 
 
 def _ensure_bus_dir() -> None:
@@ -99,10 +115,55 @@ def _read_json_safe(path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
+@atexit.register
+def _close_warm_ps() -> None:
+    global _WARM_PS_PROC
+    proc, _WARM_PS_PROC = _WARM_PS_PROC, None
+    if proc is None:
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        return
+    for pipe in (proc.stdin, proc.stdout):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _read_daemon_ack(stdout, timeout: float) -> None:
+    ready = queue.Queue()
+
+    def read_ack():
+        try:
+            ready.put(json.loads(stdout.readline().lstrip("\ufeff")))
+        except (OSError, ValueError) as error:
+            ready.put(error)
+
+    threading.Thread(target=read_ack, daemon=True).start()
+    try:
+        ack = ready.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError("UIA daemon response timed out") from None
+    if isinstance(ack, Exception):
+        raise ack
+    if not isinstance(ack, dict):
+        raise ValueError("Invalid UIA daemon acknowledgement")
+    if ack.get("daemon_ack") is not True:
+        raise ValueError(ack.get("error", "Invalid UIA daemon acknowledgement"))
+
+
 def _get_warm_ps() -> Optional[subprocess.Popen]:
     global _WARM_PS_PROC
     if _WARM_PS_PROC is not None and _WARM_PS_PROC.poll() is None:
         return _WARM_PS_PROC
+    _close_warm_ps()
     if not PS_DAEMON.exists():
         return None
     try:
@@ -129,11 +190,20 @@ def _get_warm_ps() -> Optional[subprocess.Popen]:
         return None
 
 
+def _binding_store() -> BindingStore:
+    return BindingStore(BASE_DIR, legacy_lock_path=LOCK_FILE)
+
+
+def _headless_runner() -> HeadlessCodexRunner:
+    return HeadlessCodexRunner(BASE_DIR)
+
+
 def _load_lock() -> Optional[Dict[str, Any]]:
     data = _read_json_safe(LOCK_FILE)
     if isinstance(data, dict) and data.get("bound"):
         return data
-    return None
+    active = _binding_store().list_bindings()
+    return active[0] if len(active) == 1 else None
 
 
 def _save_lock(data: Dict[str, Any]) -> None:
@@ -154,6 +224,7 @@ def _run_ps_driver(
     dispatch_id: str = "",
     payload_text: Optional[str] = None,
     timeout_sec: int = 50,
+    allow_placeholder_title: bool = False,
 ) -> Dict[str, Any]:
     if not PS_DRIVER.exists():
         return {
@@ -200,9 +271,9 @@ def _run_ps_driver(
             payload_file_str = str(payload_file)
             cmd.extend(["-PayloadFile", payload_file_str])
 
-        warm = _get_warm_ps()
-        if warm is not None and warm.stdin and warm.stdout:
-            try:
+        with _WARM_PS_LOCK:
+            warm = _get_warm_ps()
+            if warm is not None and warm.stdin and warm.stdout:
                 req_line = json.dumps(
                     {
                         "action": action,
@@ -215,26 +286,34 @@ def _run_ps_driver(
                         "dispatch_id": dispatch_id,
                         "payload_file": payload_file_str,
                         "timeout_sec": timeout_sec,
+                        "allow_placeholder_title": allow_placeholder_title,
                     },
                     ensure_ascii=False,
                 )
-                warm.stdin.write(req_line + "\n")
-                warm.stdin.flush()
-                ack = warm.stdout.readline()
-                if ack and out_file.exists():
-                    return json.loads(out_file.read_text(encoding="utf-8"))
-            except Exception:
-                global _WARM_PS_PROC
                 try:
-                    warm.kill()
-                except Exception:
-                    pass
-                _WARM_PS_PROC = None
+                    warm.stdin.write(req_line + "\n")
+                    warm.stdin.flush()
+                    _read_daemon_ack(warm.stdout, timeout_sec + 15)
+                    result = json.loads(out_file.read_text(encoding="utf-8"))
+                    if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+                        raise ValueError("Invalid UIA driver result")
+                    return result
+                except (OSError, ValueError) as error:
+                    _close_warm_ps()
+                    if action in ("dispatch", "new_project_session", "switch_session"):
+                        return {
+                            "ok": False,
+                            "error_code": "DAEMON_EXEC_UNCERTAIN",
+                            "dispatch_id": dispatch_id,
+                            "message": f"守护进程未能确认动作结果。请核实会话状态后再操作。{error}",
+                        }
+                    out_file.unlink(missing_ok=True)
 
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
+                env={**os.environ, "CODEX_DIRECTOR_ALLOW_PLACEHOLDER_TITLE": str(int(allow_placeholder_title))},
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -276,6 +355,7 @@ def _run_ps_driver(
 
 
 def parse_worker_reply(raw_text: str) -> Dict[str, Any]:
+    raw_text = re.sub(r"\[DIRECTOR_TASK\].*?(?:\[/DIRECTOR_TASK\]|\Z)", "", raw_text, flags=re.DOTALL)
     sections = {
         "summary": "",
         "files_raw": "",
@@ -291,7 +371,7 @@ def parse_worker_reply(raw_text: str) -> Dict[str, Any]:
 
     positions = []
     for tag, key in tag_map:
-        m = re.search(rf"\[{tag}\]", raw_text)
+        m = re.search(rf"(?m)^[^\S\r\n]*(?:#+[^\S\r\n]*)?\[{tag}\][^\S\r\n]*\r?$", raw_text)
         if m:
             positions.append((m.start(), m.end(), key))
 
@@ -352,6 +432,144 @@ def detect_language(*texts: str) -> str:
     return "en"
 
 
+_SPEED_ALIASES = {"default": "standard", "standard": "standard", "fast": "fast",
+                  "priority": "fast", "balanced": "balanced", "ultrafast": "ultrafast"}
+_SPEED_LABELS = {"standard": "标准", "balanced": "均衡", "fast": "快速", "ultrafast": "超快"}
+_ULTRAFAST_DESCRIPTION = "The fastest available responses for latency-sensitive work."
+_PROFILE_SIDES = {"decision": "antigravity", "worker": "codex"}
+_PROFILE_FIELDS = ("side", "model", "effort", "speed")
+
+
+def _load_routing_settings(path: Path) -> Dict[str, Any]:
+    stored = _read_json_safe(path)
+    stored = stored if isinstance(stored, dict) else {}
+    ask = stored.get("ask_model_roles_on_plan")
+    settings = {"ask_model_roles_on_plan": ask if isinstance(ask, bool) else True}
+    for role, side in _PROFILE_SIDES.items():
+        key = f"{role}_profile"
+        profile = stored.get(key)
+        settings[key] = {"side": side, "model": "", "effort": "", "speed": ""}
+        if isinstance(profile, dict):
+            settings[key].update({field: profile[field] for field in _PROFILE_FIELDS if isinstance(profile.get(field), str)})
+    return settings
+
+
+def _speed_catalog(*tiers: str, descriptions=None) -> list[dict]:
+    descriptions = descriptions or {}
+    return [{"id": tier, "label": _SPEED_LABELS[tier], "description": descriptions.get(tier, "")} for tier in tiers]
+
+
+def _codex_catalog(home: Path) -> List[Dict[str, Any]]:
+    cache = _read_json_safe(home / "models_cache.json")
+    if not isinstance(cache, dict) or not isinstance(cache.get("models"), list):
+        return [
+            {
+                "slug": slug, "display_name": name, "default_reasoning_level": default,
+                "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "speed_tiers": _speed_catalog("standard", "fast", *extra,
+                    descriptions={"ultrafast": _ULTRAFAST_DESCRIPTION}),
+            }
+            for slug, name, default, extra in (
+                ("gpt-6.2-sol", "GPT-6.2-Sol", "low", ("ultrafast",)),
+                ("gpt-6.2-astra", "GPT-6.2-Astra", "low", ()),
+            )
+        ]
+
+    models = [
+        item for item in cache["models"]
+        if isinstance(item, dict) and item.get("visibility") == "list" and item.get("slug")
+    ]
+    models.sort(key=lambda item: item["priority"] if isinstance(item.get("priority"), (int, float)) else float("inf"))
+    catalog = []
+    for model in models:
+        tiers = {"standard"}
+        descriptions = {"ultrafast": _ULTRAFAST_DESCRIPTION}
+        for tier in model.get("additional_speed_tiers") or []:
+            if isinstance(tier, str) and tier in _SPEED_ALIASES:
+                tiers.add(_SPEED_ALIASES[tier])
+        for tier in model.get("service_tiers") or []:
+            if isinstance(tier, dict) and isinstance(tier.get("id"), str) and tier["id"] in _SPEED_ALIASES:
+                key = _SPEED_ALIASES[tier["id"]]
+                tiers.add(key)
+                if tier.get("description"):
+                    descriptions[key] = tier["description"]
+        catalog.append({
+            "slug": model["slug"],
+            "display_name": model.get("display_name") or model["slug"],
+            "description": model.get("description", ""),
+            "default_reasoning_level": model.get("default_reasoning_level", ""),
+            "efforts": [level["effort"] for level in model.get("supported_reasoning_levels") or []
+                        if isinstance(level, dict) and level.get("effort")],
+            "speed_tiers": _speed_catalog(*(tier for tier in ("standard", "fast", "ultrafast") if tier in tiers),
+                                        descriptions=descriptions),
+        })
+    return catalog
+
+
+def _antigravity_catalog() -> Dict[str, Any]:
+    return {
+        "models": [
+            {"slug": slug, "display_name": name, "family": family, "efforts": ["low", "medium", "high", "xhigh"],
+             "speed_tiers": _speed_catalog("standard", "balanced", "fast")}
+            for slug, name, family in (
+                ("gemini-4-hydrogen", "Gemini 4 Hydrogen", "Gemini 4"),
+                ("gemini-4-neon", "Gemini 4 Neon", "Gemini 4"),
+                ("gemini-4-carbon", "Gemini 4 Carbon", "Gemini 4"),
+                ("gemini-4-argon", "Gemini 4 Argon", "Gemini 4"),
+                ("gemini-3.8-flash", "Gemini 3.8 Flash", "Gemini 3.8"),
+                ("claude-opus-5.5", "Claude Opus 5.5", "Claude 5.5"),
+                ("claude-sonnet-5.5", "Claude Sonnet 5.5", "Claude 5.5"),
+                ("orchestrator", "Orchestrator", "Orchestrator"),
+            )
+        ],
+        "quota_hint": '可叠加 swarm(action="models", all=true) 查询反重力侧实时可用性与配额。',
+    }
+
+
+def tool_routing_settings(action: str = "get", ask_model_roles_on_plan: Optional[bool] = None,
+                          codex_home: str = "", **profiles: str) -> Dict[str, Any]:
+    path = BASE_DIR / "director_settings.json"
+    if action == "set":
+        with _mutex(path.with_suffix(".mutex")):
+            settings = _load_routing_settings(path)
+            if ask_model_roles_on_plan is not None:
+                settings["ask_model_roles_on_plan"] = ask_model_roles_on_plan
+            for role in _PROFILE_SIDES:
+                profile = settings[f"{role}_profile"]
+                for field in _PROFILE_FIELDS:
+                    value = profiles.get(f"{role}_{field}")
+                    if value is not None:
+                        value = value.strip()
+                        profile[field] = _SPEED_ALIASES.get(value, value) if field == "speed" else value
+            _atomic_write_json(path, settings)
+    else:
+        settings = _load_routing_settings(path)
+
+    home = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    try:
+        with (home / "config.toml").open("rb") as config_file:
+            config = tomllib.load(config_file)
+    except (OSError, ValueError):
+        config = {}
+    return {
+        "ok": True,
+        "settings": settings,
+        "codex_catalog": _codex_catalog(home),
+        "codex_current_defaults": {key: config.get(key) for key in ("model", "model_reasoning_effort", "service_tier")},
+        "antigravity_catalog": _antigravity_catalog(),
+    }
+
+
+def _routing_tag() -> str:
+    settings = _load_routing_settings(BASE_DIR / "director_settings.json")
+    parts = []
+    for role in _PROFILE_SIDES:
+        profile = settings[f"{role}_profile"]
+        if profile["model"]:
+            parts.append(f'{role}={profile["side"]}:{profile["model"]}(effort={profile["effort"]},speed={profile["speed"]})')
+    return " | ".join(parts)
+
+
 def build_director_envelope(
     engine: str,
     step_goal: str,
@@ -361,6 +579,7 @@ def build_director_envelope(
     rework_round: int = 0,
     dispatch_id: str = "",
     lang: str = "",
+    routing_tag: str = "",
 ) -> str:
     eng_norm = (engine or "UNREAL").strip().upper()
     if eng_norm not in ("UNREAL", "THREEJS", "GENERAL"):
@@ -374,6 +593,9 @@ def build_director_envelope(
     )
 
     lines = ["[DIRECTOR_TASK]"]
+    routing = routing_tag.strip() or _routing_tag()
+    if routing:
+        lines.append(routing if routing.startswith("[ROUTING:") else f"[ROUTING: {routing}]")
     if dispatch_id:
         lines.append(f"[DISPATCH_ID: {dispatch_id}]")
     lines.extend(
@@ -401,19 +623,60 @@ def build_director_envelope(
 # Antigravity-Side Tool Implementations (Director Role)
 # ---------------------------------------------------------------------------
 
+def _is_placeholder_title(title: str) -> bool:
+    return not title.strip() or bool(re.search(
+        r"^(?:新聊天|新建聊天|New chat|New thread|Headless Session|Codex|ChatGPT|你说：|You said:|ChatGPT 说：|ChatGPT said:|\[SUMMARY\]|\[CONSTRAINTS\]|\d{1,2}:\d{2}(?:\s?[AP]M)?)$"
+        r"|开始新聊天|你想让我们在|我们应该在|What should we", title.strip(), re.IGNORECASE,
+    ))
+
+
+def _update_first_title(lock: dict, snapshot: dict) -> Dict[str, Any]:
+    title = str(snapshot.get("active_session") or "").strip()
+    if lock.get("awaiting_first_title", _is_placeholder_title(lock["session_title"])) and (
+        snapshot.get("title_authoritative") and not _is_placeholder_title(title)
+    ):
+        promoted = _binding_store().promote_first_title(str(lock["binding_id"]), title, authoritative=True)
+        if isinstance(promoted, dict):
+            lock.update(promoted)
+            return lock
+        lock.update(session_title=title, awaiting_first_title=False)
+        _save_lock(lock)
+    return lock
+
+
 def tool_inspect_app() -> Dict[str, Any]:
     res = _run_ps_driver(action="inspect", timeout_sec=20)
-    res["current_lock"] = _load_lock()
+    store = _binding_store()
+    active_bindings = store.list_bindings()
+    res["current_lock"] = active_bindings[0] if len(active_bindings) == 1 else _load_lock()
+    res["active_bindings"] = active_bindings
+    res["headless_codex_available"] = discover_codex_exe() is not None
     inbox = tool_check_codex_inbox()
     if inbox.get("has_pending"):
         res["pending_codex_inbox"] = {
             "pending_count": inbox.get("pending_count"),
-            "latest_submission": inbox.get("submission"),
+            "pending_summaries": inbox["pending_summaries"],
+            "oldest_pending": inbox["oldest_pending"],
+            "latest_pending": inbox["latest_pending"],
         }
     return res
 
 
-@_serialized_binding
+def _resolve_worker_model_profile(
+    codex_model: str = "",
+    codex_effort: str = "",
+    codex_speed: str = "",
+) -> Dict[str, str]:
+    settings = _load_routing_settings(BASE_DIR / "director_settings.json")
+    worker = settings.get("worker_profile") or {}
+    default_from_routing = worker if worker.get("side") == "codex" else {}
+    return {
+        "model": (codex_model or default_from_routing.get("model") or "").strip(),
+        "effort": (codex_effort or default_from_routing.get("effort") or "").strip(),
+        "speed": (codex_speed or default_from_routing.get("speed") or "").strip(),
+    }
+
+
 def tool_bind_session(
     session_title: str = "",
     engine: str = "unreal",
@@ -423,98 +686,168 @@ def tool_bind_session(
     hwnd: int = 0,
     create_in_project: str = "",
     switch_to_session: str = "",
+    workspace_path: str = "",
+    transport: str = "auto",
+    codex_session_id: str = "",
+    codex_model: str = "",
+    codex_effort: str = "",
+    codex_speed: str = "",
 ) -> Dict[str, Any]:
     proj = (create_in_project or "").strip()
     sw_sess = (switch_to_session or "").strip()
     title = (session_title or "").strip()
+    ws_clean = (workspace_path or "").strip()
+    transport_norm = (transport or "auto").strip().lower()
+    model_profile = _resolve_worker_model_profile(codex_model, codex_effort, codex_speed)
+    store = _binding_store()
 
-    if proj:
-        nav_res = _run_ps_driver(action="new_project_session", project_name=proj, target_hwnd=hwnd, timeout_sec=20)
-        if not nav_res.get("ok"):
-            return nav_res
-        matched_win = nav_res["snapshot"]
-        title = title or str(matched_win.get("active_session") or "新聊天")
-    elif sw_sess:
-        nav_res = _run_ps_driver(action="switch_session", session_name=sw_sess, target_hwnd=hwnd, timeout_sec=20)
-        if not nav_res.get("ok"):
-            return nav_res
-        matched_win = nav_res["snapshot"]
-        title = title or sw_sess
-    else:
-        if not title:
+    # Pure headless binding: works when both apps are minimized/closed and runs N sessions in parallel
+    use_headless_direct = (
+        transport_norm in ("codex_exec", "headless", "exec")
+        or (transport_norm == "auto" and ws_clean and not (proj or sw_sess or title or hwnd))
+    )
+    if use_headless_direct:
+        if not ws_clean and not codex_session_id:
             return {
                 "ok": False,
-                "error_code": "EMPTY_SESSION_TITLE",
-                "message": "必须提供 session_title、create_in_project 或 switch_to_session 之一。",
+                "error_code": "EMPTY_WORKSPACE_FOR_HEADLESS",
+                "message": "无头并发模式 (codex_exec) 需要提供 workspace_path 或 codex_session_id。",
             }
-        inspect_res = _run_ps_driver(action="inspect", timeout_sec=20)
-        if not inspect_res.get("ok"):
-            return inspect_res
-
-        windows = inspect_res.get("windows", [])
-        matched_win = None
-        for w in windows:
-            if hwnd and int(w.get("hwnd", 0)) != int(hwnd):
-                continue
-            act = str(w.get("active_session", ""))
-            wt = str(w.get("window_title", ""))
-            if title.lower() in act.lower() or act.lower() in title.lower() or title.lower() in wt.lower():
-                matched_win = w
-                break
-
-        if matched_win is None:
-            available = [
-                {
-                    "hwnd": w.get("hwnd"),
-                    "active_session": w.get("active_session"),
-                    "sidebar_sessions": w.get("sidebar_sessions", [])[:15],
-                }
-                for w in windows
-            ]
-            return {
-                "ok": False,
-                "error_code": "TARGET_SESSION_NOT_ACTIVE",
-                "message": (
-                    f"当前打开的 ChatGPT 窗口激活会话与 '{title}' 不匹配。"
-                    "可传入 switch_to_session 自动切换，或先在窗口点开目标会话。"
-                ),
-                "available_windows": available,
-            }
-
-    if matched_win.get("is_minimized"):
+        headless_title = title or (Path(ws_clean).name if ws_clean else "Headless Codex Session")
+        lock_data = store.create_binding(
+            session_title=headless_title,
+            requested_title=headless_title,
+            hwnd=0,
+            pid=0,
+            process_start=0,
+            fingerprint=f"HEADLESS|{ws_clean}|{codex_session_id}",
+            is_minimized=True,
+            awaiting_first_title=False,
+            workspace_path=ws_clean,
+            transport="codex_exec",
+            codex_session_id=codex_session_id,
+            model_profile=model_profile,
+            engine=engine,
+            mode=mode,
+            auto_apply_files=auto_apply_files,
+            max_retries=max_retries,
+        )
         return {
-            "ok": False,
-            "error_code": "WINDOW_MINIMIZED",
-            "message": "目标 ChatGPT 窗口处于最小化状态，请将其恢复显示后再锁定。",
+            "ok": True,
+            "binding_id": lock_data["binding_id"],
+            "transport": "codex_exec",
+            "message": f"已建立无头并发会话绑定: '{lock_data['session_title']}' (双端最小化与多会话并发就绪)",
+            "lock": lock_data,
         }
 
-    binding_id = uuid.uuid4().hex
-    lock_data = {
-        "bound": True,
-        "binding_id": binding_id,
-        "hwnd": int(matched_win["hwnd"]),
-        "pid": int(matched_win["pid"]),
-        "process_start": int(matched_win.get("process_start", 0)),
-        "session_title": str(matched_win["active_session"]),
-        "requested_title": sw_sess or proj or title,
-        "fingerprint": str(matched_win.get("fingerprint", "")),
-        "engine": (engine or "unreal").upper(),
-        "mode": mode if mode in ("semi_auto", "autopilot") else "semi_auto",
-        "auto_apply_files": bool(auto_apply_files),
-        "retry_count": 0,
-        "max_retries": max(1, min(int(max_retries), 6)),
-        "bound_at": _now_iso(),
-    }
-    _save_lock(lock_data)
+    try:
+        with ui_inject_lock(BASE_DIR):
+            if proj:
+                nav_res = _run_ps_driver(action="new_project_session", project_name=proj, target_hwnd=hwnd, timeout_sec=20)
+                if not nav_res.get("ok"):
+                    return nav_res
+                matched_win = nav_res["snapshot"]
+                title = title or str(matched_win.get("active_session") or "新聊天")
+            elif sw_sess:
+                nav_res = _run_ps_driver(action="switch_session", session_name=sw_sess, target_hwnd=hwnd, timeout_sec=20)
+                if not nav_res.get("ok"):
+                    return nav_res
+                matched_win = nav_res["snapshot"]
+                title = title or sw_sess
+            else:
+                if not title:
+                    return {
+                        "ok": False,
+                        "error_code": "EMPTY_SESSION_TITLE",
+                        "message": "必须提供 session_title、create_in_project、switch_to_session 或 workspace_path 之一。",
+                    }
+                inspect_res = _run_ps_driver(action="inspect", target_hwnd=hwnd, timeout_sec=20)
+                if not inspect_res.get("ok"):
+                    if transport_norm == "auto" and ws_clean and inspect_res.get("error_code") == "APP_NOT_RUNNING":
+                        lock_data = store.create_binding(
+                            session_title=title,
+                            requested_title=title,
+                            hwnd=0,
+                            is_minimized=True,
+                            awaiting_first_title=False,
+                            workspace_path=ws_clean,
+                            transport="codex_exec",
+                            codex_session_id=codex_session_id,
+                            model_profile=model_profile,
+                            engine=engine,
+                            mode=mode,
+                            auto_apply_files=auto_apply_files,
+                            max_retries=max_retries,
+                        )
+                        return {
+                            "ok": True,
+                            "binding_id": lock_data["binding_id"],
+                            "transport": "codex_exec",
+                            "message": f"桌面窗口未开启，已自动切换无头并发引擎绑定: '{lock_data['session_title']}'",
+                            "lock": lock_data,
+                        }
+                    return inspect_res
+
+                windows = inspect_res.get("windows", [])
+                matched_win = None
+                for w in windows:
+                    if hwnd and int(w.get("hwnd", 0)) != int(hwnd):
+                        continue
+                    act = str(w.get("active_session", ""))
+                    wt = str(w.get("window_title", ""))
+                    same_title = act and (title.casefold() in act.casefold() or act.casefold() in title.casefold())
+                    if same_title or title.casefold() in wt.casefold():
+                        matched_win = w
+                        break
+
+                if matched_win is None:
+                    available = [
+                        {
+                            "hwnd": w.get("hwnd"),
+                            "active_session": w.get("active_session"),
+                            "sidebar_sessions": w.get("sidebar_sessions", [])[:15],
+                        }
+                        for w in windows
+                    ]
+                    return {
+                        "ok": False,
+                        "error_code": "TARGET_SESSION_NOT_ACTIVE",
+                        "message": (
+                            f"当前打开的 ChatGPT 窗口激活会话与 '{title}' 不匹配。"
+                            "可传入 switch_to_session 自动切换，或传入 workspace_path 启用无头并发会话。"
+                        ),
+                        "available_windows": available,
+                    }
+    except TimeoutError:
+        return {"ok": False, "error_code": "BRIDGE_BUSY", "message": "UI 切换锁短暂繁忙，请稍后重试。"}
+
+    act_sess = str(matched_win["active_session"])
+    lock_data = store.create_binding(
+        session_title=act_sess,
+        requested_title=sw_sess or proj or title,
+        hwnd=int(matched_win["hwnd"]),
+        pid=int(matched_win["pid"]),
+        process_start=int(matched_win.get("process_start", 0)),
+        fingerprint=str(matched_win.get("fingerprint", "")),
+        is_minimized=bool(matched_win.get("is_minimized", False)),
+        awaiting_first_title=bool(proj or _is_placeholder_title(title) or _is_placeholder_title(act_sess)),
+        workspace_path=ws_clean,
+        transport="uia" if transport_norm == "uia" else "auto",
+        codex_session_id=codex_session_id,
+        model_profile=model_profile,
+        engine=engine,
+        mode=mode,
+        auto_apply_files=auto_apply_files,
+        max_retries=max_retries,
+    )
     return {
         "ok": True,
-        "binding_id": binding_id,
+        "binding_id": lock_data["binding_id"],
         "message": f"已成功锁定 ChatGPT 会话: '{lock_data['session_title']}' (HWND={lock_data['hwnd']})",
         "lock": lock_data,
     }
 
 
-@_serialized_binding
 def tool_dispatch_task(
     step_goal: str,
     task_instruction: str,
@@ -523,20 +856,12 @@ def tool_dispatch_task(
     is_rework: bool = False,
     timeout_sec: int = 50,
     binding_id: str = "",
+    routing_tag: str = "",
 ) -> Dict[str, Any]:
-    lock = _load_lock()
-    if not lock:
-        return {
-            "ok": False,
-            "error_code": "SESSION_NOT_BOUND",
-            "message": "门禁拦截：当前尚未绑定任何 ChatGPT 会话！必须先与制作人确认目标会话并调用 bridge_bind_session。",
-        }
-    if binding_id and lock.get("binding_id") and binding_id != lock.get("binding_id"):
-        return {
-            "ok": False,
-            "error_code": "STALE_BINDING",
-            "message": "绑定令牌已过期，请重新确认锁定目标会话。",
-        }
+    store = _binding_store()
+    lock, err = store.get_binding(binding_id)
+    if err is not None or lock is None:
+        return err or {"ok": False, "error_code": "SESSION_NOT_BOUND", "message": "未绑定任何会话。"}
 
     if is_rework:
         next_retry = int(lock.get("retry_count", 0)) + 1
@@ -551,13 +876,14 @@ def tool_dispatch_task(
                 ),
                 "lock": lock,
             }
-        lock["retry_count"] = next_retry
+        retry_val = next_retry
     else:
-        lock["retry_count"] = 0
+        retry_val = 0
 
     dispatch_id = uuid.uuid4().hex
-    lock["last_dispatch_id"] = dispatch_id
-    _save_lock(lock)
+    updated = store.update_binding(str(lock["binding_id"]), retry_count=retry_val, last_dispatch_id=dispatch_id)
+    if isinstance(updated, dict):
+        lock = updated
 
     envelope = build_director_envelope(
         engine=lock.get("engine", "UNREAL"),
@@ -567,40 +893,63 @@ def tool_dispatch_task(
         local_context=local_context,
         rework_round=int(lock.get("retry_count", 0)),
         dispatch_id=dispatch_id,
+        routing_tag=routing_tag,
     )
 
     # Cap synchronous MCP wait at 55s by default so host ~70s MCP call timeout never cancels long turns
     safe_sync_timeout = max(5, min(int(timeout_sec), 55))
 
-    driver_res = _run_ps_driver(
-        action="dispatch",
-        expected_session=str(lock["session_title"]),
-        target_hwnd=int(lock["hwnd"]),
-        target_pid=int(lock.get("pid", 0)),
-        dispatch_id=dispatch_id,
-        payload_text=envelope,
-        timeout_sec=safe_sync_timeout,
+    use_headless = (
+        lock.get("transport") == "codex_exec"
+        or (int(lock.get("hwnd", 0)) == 0 and bool(lock.get("workspace_path") or lock.get("codex_session_id")))
     )
+    if use_headless:
+        driver_res = _headless_runner().dispatch(
+            lock,
+            dispatch_id=dispatch_id,
+            envelope=envelope,
+            timeout_sec=safe_sync_timeout,
+        )
+        if not driver_res.get("ok") and not driver_res.get("timed_out"):
+            return {**driver_res, "binding_id": lock["binding_id"], "dispatch_id": dispatch_id}
+        if driver_res.get("codex_session_id"):
+            lock["codex_session_id"] = driver_res["codex_session_id"]
+    else:
+        driver_res = _run_ps_driver(
+            action="dispatch",
+            expected_session=str(lock["session_title"]),
+            target_hwnd=int(lock["hwnd"]),
+            target_pid=int(lock.get("pid", 0)),
+            dispatch_id=dispatch_id,
+            payload_text=envelope,
+            timeout_sec=safe_sync_timeout,
+            allow_placeholder_title=lock.get("awaiting_first_title", _is_placeholder_title(lock["session_title"])),
+        )
+        if not driver_res.get("ok") and not driver_res.get("timed_out"):
+            return {**driver_res, "binding_id": lock["binding_id"], "dispatch_id": dispatch_id}
+        lock = _update_first_title(lock, driver_res)
 
-    if not driver_res.get("ok") and not driver_res.get("timed_out"):
-        return {**driver_res, "dispatch_id": dispatch_id}
-
+    timed_out = bool(driver_res.get("timed_out"))
     raw_reply = str(driver_res.get("raw_reply", ""))
     parsed = parse_worker_reply(raw_reply)
+    telemetry = driver_res.get("telemetry") if isinstance(driver_res.get("telemetry"), dict) else {
+        "ui_inject_ms": driver_res.get("ui_inject_ms"),
+        "model_ttft_ms": driver_res.get("model_ttft_ms"),
+        "model_duration_ms": driver_res.get("model_duration_ms"),
+        "pickup_overhead_ms": driver_res.get("pickup_overhead_ms"),
+        "total_elapsed_ms": driver_res.get("total_elapsed_ms"),
+    }
 
     return {
-        "ok": driver_res.get("ok", False),
-        "timed_out": driver_res.get("timed_out", False),
+        "ok": bool(driver_res.get("ok")) or timed_out,
+        "timed_out": timed_out,
+        "reply_confirmed": not timed_out,
+        "binding_id": lock["binding_id"],
+        "codex_session_id": driver_res.get("codex_session_id", lock.get("codex_session_id", "")),
         "dispatch_id": dispatch_id,
         "turn_id": driver_res.get("turn_id", ""),
         "channel": driver_res.get("channel", "uia"),
-        "telemetry": {
-            "ui_inject_ms": driver_res.get("ui_inject_ms"),
-            "model_ttft_ms": driver_res.get("model_ttft_ms"),
-            "model_duration_ms": driver_res.get("model_duration_ms"),
-            "pickup_overhead_ms": driver_res.get("pickup_overhead_ms"),
-            "total_elapsed_ms": driver_res.get("total_elapsed_ms"),
-        },
+        "telemetry": telemetry,
         "message": driver_res.get("message", ""),
         "session_title": lock["session_title"],
         "mode": lock["mode"],
@@ -612,46 +961,64 @@ def tool_dispatch_task(
     }
 
 
-def tool_read_latest() -> Dict[str, Any]:
-    lock = _load_lock()
-    if not lock:
-        return {
+def tool_read_latest(binding_id: str = "") -> Dict[str, Any]:
+    store = _binding_store()
+    lock, err = store.get_binding(binding_id)
+    if err is not None or lock is None:
+        return err or {
             "ok": False,
             "error_code": "SESSION_NOT_BOUND",
             "message": "当前未绑定会话，若仅探测状态请调用 bridge_inspect_app。",
         }
+
+    use_headless = (
+        lock.get("transport") == "codex_exec"
+        or (int(lock.get("hwnd", 0)) == 0 and bool(lock.get("workspace_path") or lock.get("codex_session_id")))
+    )
+    if use_headless:
+        run_state = _headless_runner().read_latest_run(str(lock["binding_id"])) or {}
+        last_msg = str(run_state.get("raw_reply") or "")
+        is_running = run_state.get("status") == "running_async"
+        return {
+            "ok": True,
+            "binding_id": lock["binding_id"],
+            "channel": "codex_headless_exec",
+            "status": run_state.get("status", "idle"),
+            "codex_session_id": run_state.get("codex_session_id", lock.get("codex_session_id", "")),
+            "snapshot": {
+                "active_session": lock["session_title"],
+                "last_message": last_msg,
+                "is_generating": is_running,
+                "is_minimized": True,
+            },
+            "parsed_reply": parse_worker_reply(last_msg),
+        }
+
     res = _run_ps_driver(
         action="read_latest",
         expected_session=str(lock["session_title"]),
         target_hwnd=int(lock["hwnd"]),
         target_pid=int(lock.get("pid", 0)),
         timeout_sec=20,
+        allow_placeholder_title=lock.get("awaiting_first_title", _is_placeholder_title(lock["session_title"])),
     )
     if res.get("ok") and "snapshot" in res:
+        _update_first_title(lock, res["snapshot"])
         last_msg = str(res["snapshot"].get("last_message", ""))
         res["parsed_reply"] = parse_worker_reply(last_msg)
     return res
 
 
-@_serialized_binding
 def tool_create_project_session(project_name: str, hwnd: int = 0) -> Dict[str, Any]:
     proj = (project_name or "").strip()
     if not proj:
         return {"ok": False, "error_code": "EMPTY_PROJECT", "message": "必须指定目标工程名称 (project_name)。"}
-    return _run_ps_driver(action="new_project_session", project_name=proj, target_hwnd=hwnd, timeout_sec=20)
+    with ui_inject_lock(BASE_DIR):
+        return _run_ps_driver(action="new_project_session", project_name=proj, target_hwnd=hwnd, timeout_sec=20)
 
 
-@_serialized_binding
 def tool_unbind_session(binding_id: str = "") -> Dict[str, Any]:
-    prev = _load_lock()
-    if binding_id and prev and prev.get("binding_id") and binding_id != prev.get("binding_id"):
-        return {"ok": False, "error_code": "STALE_BINDING", "message": "绑定令牌不匹配，未解除新绑定。"}
-    _clear_lock()
-    return {
-        "ok": True,
-        "message": "已解除 ChatGPT 会话绑定锁。",
-        "previous_lock": prev,
-    }
+    return _binding_store().remove_binding(binding_id)
 
 
 # ---------------------------------------------------------------------------
@@ -676,8 +1043,8 @@ def _pending_submissions() -> List[Dict[str, Any]]:
     return sorted(pending.values(), key=lambda x: (x.get("submitted_at", ""), x["request_id"]))
 
 
-def tool_check_codex_inbox(request_id: str = "") -> Dict[str, Any]:
-    pending = _pending_submissions()
+def tool_check_codex_inbox(request_id: str = "", workspace_path: str = "") -> Dict[str, Any]:
+    pending = filter_submissions_by_workspace(_pending_submissions(), workspace_path)
     req_id = (request_id or "").strip()
     if req_id:
         submission = next((item for item in pending if item["request_id"] == req_id), None)
@@ -688,6 +1055,12 @@ def tool_check_codex_inbox(request_id: str = "") -> Dict[str, Any]:
         "has_pending": bool(pending),
         "pending_count": len(pending),
         "submission": submission,
+        "oldest_pending": pending[0] if pending else None,
+        "latest_pending": pending[-1] if pending else None,
+        "pending_summaries": [
+            {key: item.get(key, "") for key in ("request_id", "submitted_at", "workspace_path", "step_summary")}
+            for item in pending
+        ],
         "pending_request_ids": [item["request_id"] for item in pending],
     }
 
@@ -705,10 +1078,18 @@ def tool_reply_to_codex(
     with _mutex(BUS_DIR / "replies.mutex"):
         pending = _pending_submissions()
         req_id = (request_id or "").strip()
-        if not req_id and pending:
+        if not req_id:
+            if not pending:
+                return {"ok": False, "error_code": "NO_PENDING_REQUESTS", "message": "当前没有待评审单。"}
+            if len(pending) > 1:
+                return {
+                    "ok": False, "error_code": "AMBIGUOUS_PENDING_REQUESTS",
+                    "message": "存在多张待评审单，请指定 request_id。",
+                    "pending_request_ids": [item["request_id"] for item in pending],
+                }
             req_id = pending[0]["request_id"]
         if not REQUEST_ID.fullmatch(req_id):
-            return {"ok": False, "error_code": "INVALID_REQUEST_ID", "message": "缺少有效的 request_id。"}
+            return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID", "request_id": req_id}
 
         path = _reply_path(req_id)
         fields = {
@@ -721,6 +1102,9 @@ def tool_reply_to_codex(
             if isinstance(existing, dict) and all(existing.get(k) == v for k, v in fields.items()):
                 return {"ok": True, "already_replied": True, "reply": existing}
             return {"ok": False, "error_code": "ALREADY_REPLIED", "request_id": req_id}
+
+        if not any(item["request_id"] == req_id for item in pending):
+            return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID", "request_id": req_id}
 
         reply_payload = {
             "ok": True,
@@ -832,7 +1216,31 @@ def codex_tool_bridge_status() -> Dict[str, Any]:
 # MCP Tool Schemas by Role
 # ---------------------------------------------------------------------------
 
+def _routing_tool(name: str) -> dict:
+    return {
+        "name": name,
+        "description": "读取双侧模型、推理强度和速度目录，或保存计划阶段的决策和施工选型。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "set"], "default": "get"},
+                "ask_model_roles_on_plan": {"type": "boolean"},
+                "codex_home": {"type": "string"},
+                **{
+                    f"{role}_{field}": (
+                        {"type": "string", "enum": list(_PROFILE_SIDES.values())}
+                        if field == "side" else {"type": "string"}
+                    )
+                    for role in _PROFILE_SIDES for field in _PROFILE_FIELDS
+                },
+            },
+            "additionalProperties": False,
+        },
+    }
+
+
 AGY_MCP_TOOLS: List[Dict[str, Any]] = [
+    _routing_tool("bridge_routing_settings"),
     {
         "name": "bridge_inspect_app",
         "description": (
@@ -844,8 +1252,8 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "bridge_bind_session",
         "description": (
-            "会话加锁与一步快连工具：支持锁定当前会话，或通过 create_in_project / switch_to_session "
-            "一步原子完成新建/切换并加锁。"
+            "多会话并发加锁与快连工具：支持无头并发引擎 (codex_exec，双端最小化可用、多工程并行) "
+            "或桌面窗口绑定 (支持 session_title / create_in_project / switch_to_session)。"
         ),
         "inputSchema": {
             "type": "object",
@@ -853,6 +1261,12 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "session_title": {"type": "string", "description": "当前激活会话标题。"},
                 "create_in_project": {"type": "string", "description": "一步在指定侧边栏工程下新建会话并锁定。"},
                 "switch_to_session": {"type": "string", "description": "一步切换到侧边栏已有会话并锁定。"},
+                "workspace_path": {"type": "string", "description": "本地工程路径（传入即可启用 codex.exe 无头并发与最小化支持）。"},
+                "transport": {"type": "string", "enum": ["auto", "codex_exec", "uia"]},
+                "codex_session_id": {"type": "string", "description": "可选：续接已有的 Codex 会话 ID。"},
+                "codex_model": {"type": "string", "description": "可选：无头模式指定模型（如 gpt-6.2-sol）。"},
+                "codex_effort": {"type": "string", "description": "可选：无头模式指定推理强度（如 high / xhigh / ultra）。"},
+                "codex_speed": {"type": "string", "description": "可选：无头模式指定速度（standard / fast / ultrafast）。"},
                 "engine": {"type": "string", "enum": ["unreal", "threejs", "general"]},
                 "mode": {"type": "string", "enum": ["semi_auto", "autopilot"]},
                 "auto_apply_files": {"type": "boolean"},
@@ -864,7 +1278,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "bridge_dispatch_task",
-        "description": "向已锁定会话极速派发指令，通过 35ms 本地 JSONL 零延迟无损通道（按 dispatch_id 精确归属）回收结果。",
+        "description": "向指定 binding_id 会话无阻塞并发派发指令（支持无头 codex.exe 双端最小化并发与 35ms JSONL 轮询直连）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -872,6 +1286,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
                 "task_instruction": {"type": "string"},
                 "constraints": {"type": "string"},
                 "local_context": {"type": "string"},
+                "routing_tag": {"type": "string"},
                 "binding_id": {"type": "string"},
                 "is_rework": {"type": "boolean"},
                 "timeout_sec": {"type": "integer"},
@@ -881,8 +1296,12 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "bridge_read_latest",
-        "description": "不发消息，仅重新读取已锁定会话最新回复。",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "不发消息，按 binding_id 读取对应会话最新回复（支持多会话并发与后台异步完成回收）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"binding_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
     },
     {
         "name": "bridge_create_project_session",
@@ -907,7 +1326,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
         "description": "读取 Codex 通过双边 MCP 主动发来的待评审代码包或请示消息。",
         "inputSchema": {
             "type": "object",
-            "properties": {"request_id": {"type": "string"}},
+            "properties": {"request_id": {"type": "string"}, "workspace_path": {"type": "string"}},
             "additionalProperties": False,
         },
     },
@@ -917,7 +1336,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "request_id": {"type": "string", "description": "收件箱中的 request_id（留空则自动回复最早挂起单）。"},
+                "request_id": {"type": "string", "description": "收件箱中的 request_id（仅有一张待审单时可留空）。"},
                 "decision": {
                     "type": "string",
                     "enum": ["APPROVED", "REWORK_REQUIRED", "ESCALATE_TO_PRODUCER"],
@@ -932,6 +1351,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
 ]
 
 CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
+    _routing_tool("agy_routing_settings"),
     {
         "name": "agy_submit_for_review",
         "description": (
@@ -1030,6 +1450,9 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
     if arg_err is not None:
         return arg_err
 
+    if name == ("agy_routing_settings" if role == "codex" else "bridge_routing_settings"):
+        return tool_routing_settings(**args)
+
     if role == "codex":
         if name == "agy_submit_for_review":
             return codex_tool_submit_for_review(
@@ -1060,6 +1483,12 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
             hwnd=int(args.get("hwnd", 0)),
             create_in_project=args.get("create_in_project", ""),
             switch_to_session=args.get("switch_to_session", ""),
+            workspace_path=args.get("workspace_path", ""),
+            transport=args.get("transport", "auto"),
+            codex_session_id=args.get("codex_session_id", ""),
+            codex_model=args.get("codex_model", ""),
+            codex_effort=args.get("codex_effort", ""),
+            codex_speed=args.get("codex_speed", ""),
         )
     if name == "bridge_dispatch_task":
         return tool_dispatch_task(
@@ -1070,9 +1499,10 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
             is_rework=bool(args.get("is_rework", False)),
             timeout_sec=int(args.get("timeout_sec", 50)),
             binding_id=args.get("binding_id", ""),
+            routing_tag=args.get("routing_tag", ""),
         )
     if name == "bridge_read_latest":
-        return tool_read_latest()
+        return tool_read_latest(binding_id=args.get("binding_id", ""))
     if name == "bridge_create_project_session":
         return tool_create_project_session(
             project_name=args.get("project_name", ""),
@@ -1081,7 +1511,7 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any]) -> Dict[str, 
     if name == "bridge_unbind_session":
         return tool_unbind_session(binding_id=args.get("binding_id", ""))
     if name == "bridge_check_codex_inbox":
-        return tool_check_codex_inbox(request_id=args.get("request_id", ""))
+        return tool_check_codex_inbox(request_id=args.get("request_id", ""), workspace_path=args.get("workspace_path", ""))
     if name == "bridge_reply_to_codex":
         return tool_reply_to_codex(
             request_id=args.get("request_id", ""),
@@ -1227,6 +1657,7 @@ def run_cli(argv: list[str]) -> int:
 
     p_wait = sub.add_parser("wait_inbox")
     p_wait.add_argument("--timeout", type=int, default=600)
+    p_wait.add_argument("--only-new", action="store_true", help="Ignore requests already pending when the wait starts.")
 
     p_rep = sub.add_parser("reply_codex")
     p_rep.add_argument("--request-id", default="")
@@ -1245,12 +1676,14 @@ def run_cli(argv: list[str]) -> int:
     elif args.subcmd == "check_inbox":
         res = tool_check_codex_inbox()
     elif args.subcmd == "wait_inbox":
+        seen = {item["request_id"] for item in _pending_submissions()} if args.only_new else set()
         deadline = time.monotonic() + max(5, args.timeout)
         res = {"ok": False, "timed_out": True, "message": "等待超时，未收到 Codex 新提交。"}
         while time.monotonic() < deadline:
             pending = _pending_submissions()
-            if pending:
-                res = {"ok": True, "event": "NEW_CODEX_SUBMISSION", "submission": pending[0], "pending_count": len(pending)}
+            submission = next((item for item in pending if item["request_id"] not in seen), None)
+            if submission:
+                res = {"ok": True, "event": "NEW_CODEX_SUBMISSION", "submission": submission, "pending_count": len(pending)}
                 break
             time.sleep(0.05)
     elif args.subcmd == "reply_codex":

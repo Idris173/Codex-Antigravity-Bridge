@@ -1,15 +1,21 @@
 ---
 name: director-worker
 description: >-
-  Executes structured Unreal Engine and Three.js game development tasks when a prompt starts with the [DIRECTOR_TASK] protocol header, and communicates back to Antigravity via the antigravity_bridge MCP. Do NOT activate for normal chat messages without [DIRECTOR_TASK].
+  Executes structured tasks when the first non-empty line is [DIRECTOR_TASK], or when the user explicitly requests submission to Antigravity for review.
 ---
 
 # Director Worker Protocol (`director-worker`)
 
 ## 1. Activation Guard (严格按需触发)
 
-- **仅当**收到的消息中包含 `[DIRECTOR_TASK]` 标记，或用户明确指示向 Antigravity（反重力）提交评审/消息时，启用本技能规约。
-- 日常不含 `[DIRECTOR_TASK]` 的普通对话保持完全静默，按常规方式自然交流。
+- 仅当消息的**首个非空行**是 `[DIRECTOR_TASK]`，或用户明确要求向 Antigravity（反重力）提交评审时启用本技能。
+- 普通对话按常规流程处理。
+
+### 制定计划前确认双边模型选型
+
+- 使用 `agy_routing_settings(action="get")` 读取 `ask_model_roles_on_plan`、已保存的选型、双侧目录以及 Codex 当前默认值。收到已有 `[ROUTING: ...]` 的施工任务时沿用该任务选型。仅提交评审时按提交规约执行。
+- 开始制定新的双边计划且开关为 `true` 时，先展示两侧可用模型、各自推理强度和速度，由用户分别确认决策和施工的宿主、模型、强度与速度。Codex 速度有标准、快速和模型支持时的超快，GPT-6.2-Sol 提供 **超快（Ultrafast）**。Antigravity 可用时以 `swarm(action="models", all=true)` 补充实时配额。
+- 用 `agy_routing_settings(action="set")` 保存用户确认的选型。开关为 `false` 时沿用已保存选型。选型会进入任务封包，模型和速度由对应客户端配置。
 
 ---
 

@@ -10,6 +10,7 @@ public class WindowScanData {
     public double SidebarBoundaryX;
     public double MainRightBoundaryX;
     public string HeaderTitle = "";
+    public bool TitleAuthoritative;
     public string SelectedSidebar = "";
     public List<string> SidebarSessions = new List<string>();
     public List<string> MainTexts = new List<string>();
@@ -65,6 +66,28 @@ public static class BridgeFastUia {
 
     [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    private const int SW_SHOWNOACTIVATE = 4;
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    public static void RestoreWithoutActivation(IntPtr hWnd) {
+        if (IsIconic(hWnd)) ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+    }
+
+    public static bool HasComposerFocus(AutomationElement composer) {
+        try {
+            for (AutomationElement current = AutomationElement.FocusedElement; current != null;
+                 current = TreeWalker.RawViewWalker.GetParent(current)) {
+                if (Automation.Compare(current, composer)) return true;
+            }
+        } catch (ElementNotAvailableException) { }
+        return false;
+    }
 
     public static List<IntPtr> FindChatGptWindowHandlesFast() {
         var targetPids = new HashSet<uint>();
@@ -142,7 +165,8 @@ public static class BridgeFastUia {
         "Pinned", "Pin chat", "Archive chat", "Toggle summary pane", "New tab", "Enter full view", "Hide tabs",
         "置顶", "置顶聊天", "归档聊天", "切换摘要面板固定状态", "新标签页", "进入完整视图", "隐藏标签页",
         "Rate response", "Read aloud", "More actions", "Copy message", "Change permissions", "User messages",
-        "评价回复", "朗读", "更多操作", "复制消息", "更改权限", "用户消息"
+        "评价回复", "朗读", "更多操作", "复制消息", "更改权限", "用户消息",
+        "更改 的标记", "你的 Dot", "Your Dot", "项目", "最近", "杂项"
     };
 
     private static bool IsNoise(string s) {
@@ -159,6 +183,7 @@ public static class BridgeFastUia {
             t.StartsWith("Start new chat in ", StringComparison.OrdinalIgnoreCase) ||
             t.StartsWith("Create new chat in ", StringComparison.OrdinalIgnoreCase) ||
             t.StartsWith("New chat in ", StringComparison.OrdinalIgnoreCase) ||
+            t.EndsWith("侧边栏选项", StringComparison.Ordinal) ||
             t.EndsWith("的选项", StringComparison.Ordinal) ||
             t.EndsWith("的项目操作", StringComparison.Ordinal) ||
             t.EndsWith(" options", StringComparison.OrdinalIgnoreCase) ||
@@ -181,6 +206,20 @@ public static class BridgeFastUia {
                t.Equals("Stop generating", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static readonly Condition SidebarControl = new OrCondition(
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Hyperlink));
+
+    private static bool IsSidebarCandidate(Rect r, Rect winRect, double sidebarX, bool offscreen, bool enabled) {
+        return !offscreen && enabled && r.Width > 35 && r.Height > 0 &&
+            r.Left >= winRect.Left && r.Right <= sidebarX + 20 &&
+            r.Top > winRect.Top + 70 && r.Bottom <= winRect.Bottom;
+    }
+
+    private static bool IsSelected(AutomationElement el) {
+        return object.Equals(el.GetCachedPropertyValue(SelectionItemPattern.IsSelectedProperty), true);
+    }
+
     public static WindowScanData ScanWindowFast(AutomationElement win, bool includeSidebar) {
         var result = new WindowScanData();
         Rect winRect = win.Current.BoundingRectangle;
@@ -192,15 +231,16 @@ public static class BridgeFastUia {
         cr.Add(AutomationElement.IsOffscreenProperty);
         cr.Add(AutomationElement.IsKeyboardFocusableProperty);
         cr.Add(AutomationElement.IsEnabledProperty);
+        cr.Add(SelectionItemPattern.IsSelectedProperty);
         cr.TreeScope = TreeScope.Element;
 
         Condition cond = new OrCondition(
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+            SidebarControl,
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document),
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Header),
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Hyperlink)
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem)
         );
 
         AutomationElementCollection elements;
@@ -242,13 +282,14 @@ public static class BridgeFastUia {
             ? (promptRect.Left - 20)
             : (winRect.Left + winRect.Width * 0.25);
         double mainRightX = (promptElem != null) ? (promptRect.Right + 140) : winRect.Right;
-        double headerMaxY = winRect.Top + winRect.Height * 0.10;
+        double headerMaxY = winRect.Top + Math.Min(54.0, winRect.Height * 0.08);
         double mainMaxY = (promptElem != null) ? (promptRect.Top + 4) : winRect.Bottom;
 
         result.SidebarBoundaryX = sidebarX;
         result.MainRightBoundaryX = mainRightX;
 
         var seenSidebar = new HashSet<string>(StringComparer.Ordinal);
+        string selectedTab = "";
 
         // Pass 2 in pure cached memory: zero IPC overhead!
         for (int i = 0; i < elements.Count; i++) {
@@ -259,18 +300,14 @@ public static class BridgeFastUia {
                 string rawName = el.Cached.Name ?? "";
                 Rect r = el.Cached.BoundingRectangle;
 
-                if (includeSidebar && r.Width > 35 && r.Right <= (sidebarX + 20) && r.Top > (winRect.Top + 70)) {
-                    if (ct == ControlType.Button || ct == ControlType.Hyperlink) {
-                        string trimmed = rawName.Trim();
-                        if (trimmed.Length <= 90 && !IsNoise(trimmed)) {
-                            if (seenSidebar.Add(trimmed)) {
-                                result.SidebarSessions.Add(trimmed);
-                            }
-                        }
-                    }
-                }
-
                 if (off) continue;
+
+                string trimmed = rawName.Trim();
+                if ((ct == ControlType.Button || ct == ControlType.Hyperlink) && trimmed.Length <= 90 &&
+                    IsSidebarCandidate(r, winRect, sidebarX, off, el.Cached.IsEnabled) && !IsNoise(trimmed)) {
+                    if (includeSidebar && seenSidebar.Add(trimmed)) result.SidebarSessions.Add(trimmed);
+                    if (result.SelectedSidebar.Length == 0 && IsSelected(el)) result.SelectedSidebar = trimmed;
+                }
 
                 if (ct == ControlType.Button) {
                     if (r.Left > sidebarX && r.Right <= (mainRightX + 60) && IsStopButtonName(rawName)) {
@@ -278,13 +315,13 @@ public static class BridgeFastUia {
                     }
                 }
 
-                if (result.HeaderTitle.Length == 0 && r.Left > sidebarX && r.Right <= mainRightX &&
-                    r.Top >= (winRect.Top + 4) && r.Bottom <= headerMaxY) {
-                    if (ct == ControlType.Text || ct == ControlType.Header || ct == ControlType.Button) {
-                        string trimmed = rawName.Trim();
-                        if (!IsNoise(trimmed)) {
-                            result.HeaderTitle = trimmed;
-                        }
+                if (!r.IsEmpty && r.Top >= winRect.Top && r.Bottom <= headerMaxY && !IsNoise(trimmed)) {
+                    if (ct == ControlType.TabItem && IsSelected(el)) {
+                        selectedTab = trimmed;
+                    } else if (result.HeaderTitle.Length == 0 && r.Left > sidebarX && r.Right <= mainRightX &&
+                        (ct == ControlType.Text || ct == ControlType.Header)) {
+                        result.HeaderTitle = trimmed;
+                        result.TitleAuthoritative = true;
                     }
                 }
 
@@ -301,51 +338,76 @@ public static class BridgeFastUia {
             } catch { }
         }
 
+        if (selectedTab.Length > 0 || result.SelectedSidebar.Length > 0) {
+            result.HeaderTitle = selectedTab.Length > 0 ? selectedTab : result.SelectedSidebar;
+            result.TitleAuthoritative = true;
+        }
         return result;
     }
 
-    public static string InvokeButtonFast(AutomationElement win, string exactPrimary, string exactSecondary, string containsFallback) {
+    public static bool TryExpandSidebar(AutomationElement win) {
+        return InvokeNavigation(win, null, false, "打开侧边栏", "展开侧边栏", "显示侧边栏",
+            "Open sidebar", "Expand sidebar", "Show sidebar") != null;
+    }
+
+    public static string InvokeSidebarItem(AutomationElement win, double sidebarX, bool projectAction, params string[] names) {
+        return InvokeNavigation(win, sidebarX, projectAction, names);
+    }
+
+    private static string InvokeNavigation(AutomationElement win, double? sidebarX, bool projectAction, params string[] names) {
         var cr = new CacheRequest();
         cr.Add(AutomationElement.NameProperty);
+        cr.Add(AutomationElement.BoundingRectangleProperty);
+        cr.Add(AutomationElement.IsOffscreenProperty);
+        cr.Add(AutomationElement.IsEnabledProperty);
         cr.TreeScope = TreeScope.Element;
 
-        Condition btnCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button);
-        AutomationElementCollection buttons;
+        AutomationElementCollection candidates;
         using (cr.Activate()) {
-            buttons = win.FindAll(TreeScope.Descendants, btnCond);
+            candidates = win.FindAll(TreeScope.Descendants, SidebarControl);
         }
 
-        AutomationElement matchPrimary = null;
-        AutomationElement matchSecondary = null;
-        AutomationElement matchFallback = null;
-
-        for (int i = 0; i < buttons.Count; i++) {
-            AutomationElement b = buttons[i];
+        Rect winRect = win.Current.BoundingRectangle;
+        InvokePattern target = null;
+        string targetName = null;
+        InvokePattern partial = null;
+        string partialName = null;
+        bool ambiguousPartial = false;
+        int best = names.Length;
+        foreach (AutomationElement el in candidates) {
             try {
-                string n = (b.Cached.Name ?? "").Trim();
-                if (n.Length == 0) continue;
-                if (!string.IsNullOrEmpty(exactPrimary) && string.Equals(n, exactPrimary, StringComparison.OrdinalIgnoreCase)) {
-                    matchPrimary = b;
-                    break;
+                bool offscreen = el.Cached.IsOffscreen;
+                bool enabled = el.Cached.IsEnabled;
+                if (offscreen || !enabled) continue;
+                if (sidebarX.HasValue && !IsSidebarCandidate(el.Cached.BoundingRectangle, winRect, sidebarX.Value, offscreen, enabled)) continue;
+
+                string name = (el.Cached.Name ?? "").Trim();
+                if (sidebarX.HasValue && !projectAction && (name.Length > 90 || IsNoise(name))) continue;
+                int match = Array.FindIndex(names, value => string.Equals(name, value, StringComparison.OrdinalIgnoreCase));
+                bool partialMatch = match < 0 && sidebarX.HasValue && !projectAction && names.Length > 0 &&
+                    !string.IsNullOrWhiteSpace(names[0]) && name.IndexOf(names[0], StringComparison.OrdinalIgnoreCase) >= 0;
+                object pattern;
+                if ((partialMatch || (match >= 0 && match < best)) && el.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) {
+                    if (partialMatch) {
+                        ambiguousPartial = partial != null;
+                        partial = (InvokePattern)pattern;
+                        partialName = name;
+                        continue;
+                    }
+                    best = match;
+                    target = (InvokePattern)pattern;
+                    targetName = name;
                 }
-                if (matchSecondary == null && !string.IsNullOrEmpty(exactSecondary) && string.Equals(n, exactSecondary, StringComparison.OrdinalIgnoreCase)) {
-                    matchSecondary = b;
-                }
-                if (matchFallback == null && !string.IsNullOrEmpty(containsFallback) && n.IndexOf(containsFallback, StringComparison.OrdinalIgnoreCase) >= 0) {
-                    matchFallback = b;
-                }
-            } catch { }
+            } catch (ElementNotAvailableException) { }
         }
 
-        AutomationElement target = matchPrimary ?? matchSecondary ?? matchFallback;
+        if (target == null && !ambiguousPartial) {
+            target = partial;
+            targetName = partialName;
+        }
         if (target == null) return null;
-
-        object patObj;
-        if (target.TryGetCurrentPattern(InvokePattern.Pattern, out patObj)) {
-            ((InvokePattern)patObj).Invoke();
-            return target.Cached.Name ?? "";
-        }
-        return null;
+        target.Invoke();
+        return targetName;
     }
 
     public static bool TryClickComposerSendButton(AutomationElement win, double sidebarX, double mainRightX, double minTopY) {
@@ -364,6 +426,7 @@ public static class BridgeFastUia {
 
         for (int i = 0; i < buttons.Count; i++) {
             AutomationElement b = buttons[i];
+            InvokePattern send = null;
             try {
                 if (b.Cached.IsOffscreen || !b.Cached.IsEnabled) continue;
                 Rect r = b.Cached.BoundingRectangle;
@@ -379,12 +442,15 @@ public static class BridgeFastUia {
                         n.Equals("Submit", StringComparison.OrdinalIgnoreCase)) {
                         object patObj;
                         if (b.TryGetCurrentPattern(InvokePattern.Pattern, out patObj)) {
-                            ((InvokePattern)patObj).Invoke();
-                            return true;
+                            send = (InvokePattern)patObj;
                         }
                     }
                 }
-            } catch { }
+            } catch (ElementNotAvailableException) { }
+            if (send != null) {
+                send.Invoke();
+                return true;
+            }
         }
         return false;
     }

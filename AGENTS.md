@@ -21,7 +21,7 @@ python install.py --doctor
 
 Regardless of which AI agent invokes `install.py`, it performs the exact same non-destructive steps on the current user's Windows machine:
 
-1. **Deploys Shared Bidirectional Bridge Engine** to `~/.gemini/config/sidecars/chatgpt-bridge/` (`bridge_server.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) and precompiles `BridgeFastUia.dll` using the local `.NET` toolchain.
+1. **Deploys Shared Bidirectional Bridge Engine** to `~/.gemini/config/sidecars/chatgpt-bridge/` (`bridge_server.py`, `headless_multi_engine.py`, `BridgeFastUia.cs`, `uia_driver.ps1`, `uia_daemon.ps1`) and precompiles `BridgeFastUia.dll` using the local `.NET` toolchain.
 2. **Installs Antigravity Director Skill** to `~/.gemini/config/skills/codex-director/` (`SKILL.md` + Unreal Engine & Three.js review checklists).
 3. **Installs Codex Worker Skill** to `~/.codex/skills/director-worker/SKILL.md`.
 4. **Merges Both MCP Configurations Non-Destructively** (creating timestamped `.bak` backups before modifying existing files and preserving all existing MCP servers):

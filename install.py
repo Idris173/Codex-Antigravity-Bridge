@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import dataclass
 
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
 CODEX_TABLE = ("mcp_servers", CODEX)
@@ -28,9 +28,9 @@ TOOLS = {
     AGY: {
         "bridge_inspect_app", "bridge_bind_session", "bridge_dispatch_task",
         "bridge_read_latest", "bridge_create_project_session", "bridge_unbind_session",
-        "bridge_check_codex_inbox", "bridge_reply_to_codex",
+        "bridge_check_codex_inbox", "bridge_reply_to_codex", "bridge_routing_settings",
     },
-    CODEX: {"agy_submit_for_review", "agy_fetch_director_reply", "agy_bridge_status"},
+    CODEX: {"agy_submit_for_review", "agy_fetch_director_reply", "agy_bridge_status", "agy_routing_settings"},
 }
 TEXT = {
     "en": {
@@ -41,6 +41,7 @@ TEXT = {
         "error": "Error",
         "healthy": "Both MCP roles and the installation passed.",
         "unhealthy": "One or more installation checks failed.",
+        "uninstall_locked": "Exit the host using the UI Automation DLL and rerun --uninstall to finish.",
         "dll_deferred": "DLL precompilation was deferred. An in-use DLL can be refreshed by rerunning the installer after its host stops.",
     },
     "zh": {
@@ -51,6 +52,7 @@ TEXT = {
         "error": "错误",
         "healthy": "双边 MCP 和安装检查均已通过。",
         "unhealthy": "一项或多项安装检查未通过。",
+        "uninstall_locked": "请退出正在使用 UI 自动化 DLL 的宿主，然后重跑 --uninstall 完成卸载。",
         "dll_deferred": "已跳过 DLL 预编译。若 DLL 正在使用，可在宿主退出后重新运行安装器更新。",
     },
 }
@@ -263,6 +265,10 @@ def toml_string(value):
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else toml_string(key)
+
+
 def toml_value(value):
     if isinstance(value, str):
         return toml_string(value)
@@ -305,9 +311,9 @@ def rewrite_toml(source, entry, remaining_servers, keep_empty_map):
     body = "".join(output)
     if entry is not None:
         block = ["[mcp_servers.antigravity_bridge]"]
-        block.extend(f"{key} = {toml_value(value)}" for key, value in entry.items() if key != "env")
+        block.extend(f"{toml_key(key)} = {toml_value(value)}" for key, value in entry.items() if key != "env")
         block += ["", "[mcp_servers.antigravity_bridge.env]"]
-        block.extend(f"{key} = {toml_value(value)}" for key, value in entry["env"].items())
+        block.extend(f"{toml_key(key)} = {toml_value(value)}" for key, value in entry["env"].items())
     elif keep_empty_map and "mcp_servers" not in tomllib.loads(body):
         block = ["[mcp_servers]"]
     else:
@@ -481,15 +487,55 @@ def install(layout, python):
     return backups, dll_ok
 
 
+class LockedBridgeLibrary(PermissionError):
+    pass
+
+
 def uninstall(layout):
     _, edits = plans(layout)
     owns_installation = layout.state.is_file() or any(old != new for _, old, new in edits)
-    directories = [layout.check_path(path) for path in [layout.bridge, *(dest for _, dest in layout.skills)]]
+    if not owns_installation:
+        return []
+
+    bridge = layout.check_path(layout.bridge)
+    dlls = [bridge / "BridgeFastUia.dll", *(
+        path for path in bridge.glob("BridgeFastUia.*.old.dll")
+        if re.fullmatch(r"BridgeFastUia\.\d+\.old\.dll", path.name)
+    )]
+    for dll in dlls:
+        try:
+            layout.check_path(dll).unlink(missing_ok=True)
+        except PermissionError as error:
+            raise LockedBridgeLibrary(f"UI Automation DLL: {dll}") from error
+
+    files = [bridge / name for name in (*BRIDGE_FILES, "session_lock.json", "session_lock.mutex", "director_settings.mutex")]
+    bindings = layout.check_path(bridge / "bindings")
+    files.extend(bindings / name for name in ("bindings.mutex", "ui_inject.mutex"))
+    files.extend(path for path in bindings.glob("*.json") if re.fullmatch(r"[A-Za-z0-9_.-]+\.json", path.name))
+    files.extend(path for path in bindings.glob(".tmp_last_msg_*.txt"))
+    bus = layout.check_path(bridge / "bus")
+    requests = layout.check_path(bus / "requests")
+    files.extend(bus / name for name in ("to_antigravity.json", "to_codex_latest.json", "replies.mutex"))
+    files.extend(path for path in requests.glob("req_*.json") if re.fullmatch(r"req_\d+_[0-9a-f]{6,32}\.json", path.name))
+    files.extend(path for path in bus.glob("to_codex_req_*.json") if re.fullmatch(r"to_codex_req_\d+_[0-9a-f]{6,32}\.json", path.name))
+    directories = {bridge, bindings, bus, requests}
+    for source, destination in layout.skills:
+        layout.check_path(destination)
+        directories.add(destination)
+        for asset in source.rglob("*"):
+            if asset.is_file():
+                target = destination / asset.relative_to(source)
+                files.append(target)
+                directories.update(parent for parent in target.parents if parent.is_relative_to(destination))
+    for path in files:
+        layout.check_path(path).unlink(missing_ok=True)
+
     backups = [backup for path, old, new in edits if (backup := write_config(path, old, new))]
-    if owns_installation:
-        for directory in directories:
-            if directory.is_dir():
-                shutil.rmtree(directory)
+    layout.state.unlink(missing_ok=True)
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        layout.check_path(directory)
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
     return backups
 
 
@@ -646,6 +692,9 @@ def main(argv=None):
         for backup in backups:
             print(f'{text["backup"]}: {backup}')
         return 0
+    except LockedBridgeLibrary as error:
+        print(f'{text["uninstall_locked"]} {error}', file=sys.stderr)
+        return 1
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         if args.doctor:
             print(json.dumps({"ok": False, "language": language, "message": text["unhealthy"], "error": str(error)}, ensure_ascii=False))
