@@ -62,6 +62,19 @@ python install.py --doctor
 
 可以直接对任一端说“在这个目录开一个配对会话，让 Codex 核对安装指南”。桥接工具负责传递会话和请求编号。无头 Codex 默认用自然语言收发。桌面窗口模式和授权回传一次结果的只读派发沿用旧封包。
 
+### 双向只读测试
+
+1. 在 Antigravity 的目标项目里打开一条桌面聊天。在 Codex 中打开同一个项目文件夹，[连到这条聊天](#配对工作区)，并开启[自动通知](#可选功能antigravity-会话自动通知)。如果刚更新桥接，在 Antigravity 的「自定义 → 已安装 → MCP 服务器」中重启 `chatgpt-bridge`。
+2. **在 Codex 里**，说“给我选的 Antigravity 聊天发一句‘桥接测试’，请它回一句‘收到了’。帮我确认回话来自我选的项目和聊天。不要改项目文件。”
+3. **在同一条 Antigravity 聊天里**，说“请让 Codex 读一下 [文件名]，告诉我 [要查的内容]。不要改项目文件。我允许 Codex 回一条结果。收到后，请回 Codex 一句‘收到了’，再告诉我它查到了什么。”
+
+Windows 实测在 StableFluidsSTIR 项目下的 **Bridge Testing** 桌面会话完成，两边都通过。
+
+- **Codex → Antigravity → Codex**。桌面会话回传 `STIR-RELOAD-PONG-83B6`，回执中的项目 ID 和会话 ID 都与 Antigravity 的原生记录一致。
+- **Antigravity → Codex → Antigravity**。Codex 在只读沙箱读取 `StableFluidsSTIR.uproject`，回传 `FileVersion = 3`。Antigravity 按同一请求编号回执 `APPROVED`，确认标记为 `STIR-REVERSE-ACK-83B6`。工程描述文件的哈希前后一致。
+
+也可以从[提示词速查页](./docs/bridge-prompts.html)的「两边试一下」复制这两句话。
+
 ### 1. Antigravity → Codex（会话绑定、任务派发与结果回收）
 
 #### 无头多会话模式（推荐本地工作区使用）

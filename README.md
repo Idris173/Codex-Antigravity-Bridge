@@ -62,6 +62,19 @@ If Antigravity's MCP configuration is blank, the installer saves it as a `.bak` 
 
 Ask either app in plain language, for example “Open a paired session for this folder and have Codex check the setup guide.” The bridge passes session and request identifiers through its tools. Headless Codex requests and replies use natural language by default. Desktop window mode and authorized one-time receipts for read-only tasks keep the legacy envelope.
 
+### Test Both Ways Without Editing Files
+
+1. In Antigravity, open a desktop chat inside the project you want to test. In Codex, open the same project folder and [pair it with that chat](#pair-a-workspace). Turn on [automatic notifications](#optional-antigravity-conversation-notifications). If you just updated the bridge, restart `chatgpt-bridge` under **Customizations → Installed → MCP Servers** in Antigravity.
+2. **In Codex**, say “Send ‘bridge test’ to the Antigravity chat I picked. Ask it to say ‘I got it.’ Check that the reply came from the right project and chat. Don’t change any project files.”
+3. **In that same Antigravity chat**, say “Ask Codex to read [file name] and tell me [what to check]. Don’t change any project files. I allow Codex to send one result. When you get it, tell Codex you got it, then tell me what it found.”
+
+Both directions passed on Windows in the StableFluidsSTIR project’s **Bridge Testing** desktop chat.
+
+- **Codex → Antigravity → Codex.** The chat returned `STIR-RELOAD-PONG-83B6`. The reply’s project ID and chat ID matched the Antigravity records.
+- **Antigravity → Codex → Antigravity.** Codex read `StableFluidsSTIR.uproject` in a read-only sandbox and sent back `FileVersion = 3`. Antigravity acknowledged the same request with `APPROVED` and `STIR-REVERSE-ACK-83B6`. The file hash matched before and after the test.
+
+Copy either message from the **Test both ways** section of the [prompt guide](./docs/bridge-prompts.html).
+
 ### 1. Antigravity → Codex (Bind, Dispatch & Collect)
 
 #### Headless Multi-Session Mode (Recommended for Local Workspaces)

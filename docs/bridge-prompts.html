@@ -231,6 +231,36 @@
 </article>
   </div>
 </section>
+<section class="group" id="readonly-test" aria-labelledby="readonly-test-title">
+  <h2 id="readonly-test-title">两边试一下</h2>
+  <p class="group-intro">先把同一个项目文件夹连到 Antigravity 的桌面聊天，并打开自动通知。刚更新的话，先在 Antigravity 里重启桥接服务。先对 Codex 说第一句，再到刚连好的 Antigravity 聊天里说第二句。</p>
+
+  <div class="cards">
+<article class="card" data-audience="codex" aria-labelledby="readonly-test-1-title">
+  <div class="card-head">
+    <h3 id="readonly-test-1-title">发一句话，等它回</h3>
+    <span class="recipient">对 Codex 说</span>
+  </div>
+
+  <p class="prompt-text" id="readonly-test-1-prompt">给我选的 Antigravity 聊天发一句「桥接测试」，请它回一句「收到了」。帮我确认回话来自我选的项目和聊天。不要改项目文件。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="readonly-test-1-prompt" aria-label="复制 发一句话，等它回">复制</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="readonly-test-2-title">
+  <div class="card-head">
+    <h3 id="readonly-test-2-title">请 Codex 读一个文件</h3>
+    <span class="recipient">对 Antigravity 说</span>
+  </div>
+
+  <p class="prompt-text" id="readonly-test-2-prompt">请让 Codex 读一下 <span class="variable">[文件名]</span>，告诉我 <span class="variable">[要查的内容]</span>。不要改项目文件。我允许 Codex 回一条结果。收到后，请回 Codex 一句「收到了」，再告诉我它查到了什么。</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="readonly-test-2-prompt" aria-label="复制 请 Codex 读一个文件">复制</button>
+  </div>
+</article>
+  </div>
+  <p>Windows 实测中，StableFluidsSTIR 的 Bridge Testing 桌面聊天收到了 Codex 的消息，回话中的项目和聊天都对。反过来，Codex 读出了 <code>StableFluidsSTIR.uproject</code> 的 <code>FileVersion = 3</code>，Antigravity 收到结果后回了确认。工程描述文件前后相同。</p>
+</section>
 <section class="group" id="dispatch" aria-labelledby="dispatch-title">
   <h2 id="dispatch-title">请它帮忙</h2>
 
@@ -449,6 +479,36 @@
   </div>
 </article>
   </div>
+</section>
+<section class="group" id="en-readonly-test" aria-labelledby="en-readonly-test-title">
+  <h2 id="en-readonly-test-title">Test both ways</h2>
+  <p class="group-intro">Connect the same project folder to an Antigravity desktop chat and turn on automatic notifications. If you just updated the bridge, restart its service in Antigravity. Say the first message to Codex, then say the second in the Antigravity chat you connected.</p>
+
+  <div class="cards">
+<article class="card" data-audience="codex" aria-labelledby="en-readonly-test-1-title">
+  <div class="card-head">
+    <h3 id="en-readonly-test-1-title">Send a message and wait for a reply</h3>
+    <span class="recipient">Say to Codex</span>
+  </div>
+
+  <p class="prompt-text" id="en-readonly-test-1-prompt">Send “bridge test” to the Antigravity chat I picked. Ask it to say “I got it.” Check that the reply came from the right project and chat. Don’t change any project files.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-readonly-test-1-prompt" aria-label="Copy Send a message and wait for a reply">Copy</button>
+  </div>
+</article>
+<article class="card" data-audience="antigravity" aria-labelledby="en-readonly-test-2-title">
+  <div class="card-head">
+    <h3 id="en-readonly-test-2-title">Ask Codex to read a file</h3>
+    <span class="recipient">Say to Antigravity</span>
+  </div>
+
+  <p class="prompt-text" id="en-readonly-test-2-prompt">Ask Codex to read <span class="variable">[file name]</span> and tell me <span class="variable">[what to check]</span>. Don’t change any project files. I allow Codex to send one result. When you get it, tell Codex you got it, then tell me what it found.</p>
+  <div class="card-foot">
+    <button class="copy" type="button" data-copy="en-readonly-test-2-prompt" aria-label="Copy Ask Codex to read a file">Copy</button>
+  </div>
+</article>
+  </div>
+  <p>In the Windows test, the Bridge Testing desktop chat in the StableFluidsSTIR project replied to Codex with matching project and chat IDs. In the other direction, Codex read <code>FileVersion = 3</code> from <code>StableFluidsSTIR.uproject</code> and Antigravity confirmed it got the result. The project file was the same before and after.</p>
 </section>
 <section class="group" id="en-dispatch" aria-labelledby="en-dispatch-title">
   <h2 id="en-dispatch-title">Ask for help</h2>
