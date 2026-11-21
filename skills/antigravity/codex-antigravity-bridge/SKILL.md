@@ -54,9 +54,11 @@ description: >-
 
 ### 路径 D：接收与批复 Codex 侧反向 MCP 提交（零 `computer-use` 全双工总线）
 - Codex 侧已注册反向 MCP 服务 `antigravity_bridge`，可通过 `agy_submit_for_review` 向本地共享总线投递待审代码或请示。
-- 调用 `bridge_check_codex_inbox` 查看收件箱，可传 `workspace_path` 按工程筛选。收到已配对请求时，用 `bridge_claim_codex_request` 领取正文。审查后将同一 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。
+- 调用 `bridge_check_codex_inbox` 查看收件箱，可传 `workspace_path` 按工程筛选。收到已配对请求时，在当前会话调用 `bridge_claim_codex_request` 领取正文，审查后将同一 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。等待宿主钩子自动完成会话身份与模型校验，**切勿自行填写 `model_proof`**。
 - 处理原生项目配对请求时，先独立确定目标项目名称、真实根目录与原生项目 UUID，再查宿主返回的会话归属。对带 `target_project_id` 和 `target_conversation_id` 的请求，只有当前会话的宿主元数据同时吻合这两个 ID 和工程根目录才处理，并用同一 `request_id` 回执。无法取得归属证据或发现不符时停止处理并报告原因。
-- 桌面桥接要使用原生桌面会话。已实测 Windows 的 `agy --project=<project_uuid>` 新建的会话使用独立的 `antigravity-cli` 存储，桌面 Sidecar 无法读取。请用户在原生项目中手动新开桌面会话并发送首条消息。项目尚不存在且缺少已验证的创建路径时，请用户先用对应名称和同一根目录创建项目。保留原会话，不使用 UI 驱动或额外 Sidecar 项目代替。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
+- **常规桌面路径**使用目标原生项目内的桌面会话。Windows 实测 `agy --project=<project_uuid>` 新建的 CLI 会话位于独立的 `antigravity-cli` 存储，桌面 Sidecar 无法读取。未启用实验性工具时，请用户在对应原生项目中手动新开桌面会话并发送首条消息。项目尚不存在时，请用户先用对应名称和同一根目录创建项目。保留原会话，不使用 UI 驱动或额外 Sidecar 项目代替。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
+- **实验性桌面创建与唤醒**默认关闭，使用本机 Antigravity 未公开的桌面 RPC。用户明确授权后，Codex 可用 `agy_provision_desktop_workspace` 创建或复用原生项目及会话，用 `session_key` 在同一项目内新开会话，并在配对核验后提交任务。Antigravity 2.34.0 已通过隔离实测。
+- 新建的空白会话可能在 `notified` 后仍未开始运行。Codex 可用 `agy_wake_desktop_workspace` 对同一请求唤醒。会话启动后，仍通过 `bridge_claim_codex_request` 领取，并用同一 `request_id` 回写。
 - 宿主钩子会核验领取和回执的目标会话。若请求指定了模型，钩子还会核验实际调用的模型。核验失败时停止处理并报告原因。
 
 ### 接收已有桌面会话的切模请求

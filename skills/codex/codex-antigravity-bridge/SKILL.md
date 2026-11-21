@@ -48,10 +48,19 @@ description: >-
 
 - 把用户的自然语言意图传给 `agy_submit_for_review`，设 `wait_for_reply=false`，把返回的 `request_id` 留给工具调用。用 `agy_fetch_director_reply` 询问同一请求的投递状态与结果。
 - 当用户指定 Antigravity 工程时，先确定 Codex 工程的真实根目录和名称，再找到同一根目录、对应名称的 Antigravity 原生项目。从该项目独立取得预期项目 UUID。候选会话返回的项目 ID 只用于比对，不能反填成预期 ID。
-- 桌面桥接要使用原生桌面会话。已实测 Windows 的 `agy --project=<project_uuid>` 能在指定项目下新建 CLI 会话，但会话存储在独立的 `antigravity-cli` 目录，桌面 Sidecar 无法读取该会话。请用户在正式项目里手动新开桌面会话、发送首条消息并提供会话 ID。项目尚不存在且缺少已验证的创建路径时，请用户先用对应名称和同一根目录创建项目。桥接的 `open` 会返回会话要求。禁止创建替代 Sidecar 项目或用 UI 驱动代办。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
+- 桌面桥接使用目标原生项目里的桌面会话。若没有可用路由，优先复用用户指定的会话。实验性创建工具不可用时，请用户在同一目录对应的原生项目中新开桌面会话、发送首条消息并提供会话 ID。CLI 会话和额外 Sidecar 项目无法代替目标原生会话。 [Antigravity 项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
 - 用 `agy_workspace_pair(action="link", workspace_path=..., project_id=..., conversation_id=...)` 登记会话。`get` 显示 `route.status="confirmed"` 且项目与会话 ID 均符合预期后，才可提交该项目的请求。旧配对若只校验过目录，须重新 `link`。
 - 用同一 `request_id` 核对目标会话回执中的项目和会话 ID。宿主钩子会在领取正文和写回回执时核验会话身份。
 - 用户指定必须使用的 Antigravity 模型时，将 `required_model` 和已确认的 `target_conversation_id` 作为工具参数。路由偏好不代表实际执行。只有宿主确认后任务正文才可领取。发现模型不符时保留等待状态并汇报，用户要求取消时调用 `agy_cancel_guarded_review`。
+
+### 实验性创建和唤醒原生桌面会话
+
+仅在用户授权创建或启动原生桌面会话，且 MCP 工具列表暴露相应工具时使用。原型默认关闭，依赖已实测的本机 Antigravity 桌面内部接口。开发试验可为单独运行的桥接进程设置 `CODEX_AGY_EXPERIMENTAL_HUB=hub_<HTTP端口>.json`，使用当前本机宿主的运行时文件名。
+
+1. 调用 `agy_provision_desktop_workspace(workspace_path, project_name)`。要在同一项目下新开会话时传入不同的 `session_key`。原样重试使用相同的 key。保留工具回读核验后的 `project_id` 与 `conversation_id`。
+2. 用这两个 ID 调用 `agy_workspace_pair(action="link", ...)`，等待 `get` 确认路由。在为同一目录切换路由前，确认上一单已领取或已有回执。调用 `agy_submit_for_review` 并记录 `request_id`。
+3. 若空白会话停留在 `notified` 且未开始领取，调用 `agy_wake_desktop_workspace(workspace_path, project_id, conversation_id, request_id)` 唤醒同一会话和同一单。指定模型时，唤醒的 `model_id` 使用宿主目录中的准确档位，并与提交的 `required_model` 一致，例如 `gemini-4-carbon-medium`。
+4. 用 `agy_fetch_director_reply` 追踪领取与回写。收到回执后核对请求、项目和会话 ID。指定模型时还要核对 `execution_model` 与 `reply_model`。唤醒返回 `sent` 只确认宿主接收消息。
 
 ### 切换 Antigravity 已有桌面会话的模型
 

@@ -1281,6 +1281,53 @@ def _project_verified_route(route: Dict[str, Any]) -> bool:
     return bool(expected and route.get("status") == "confirmed" and route.get("project_id") == expected)
 
 
+def tool_provision_desktop_workspace(workspace_path: str, project_name: str, session_key: str = "") -> Dict[str, Any]:
+    hub_name = os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB", "")
+    if not hub_name:
+        return {"ok": False, "error_code": "NATIVE_DESKTOP_PROTOTYPE_DISABLED"}
+    workspace = _existing_workspace(workspace_path)
+    if not workspace:
+        return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
+    if not project_name.strip() or len(project_name) > 100:
+        return {"ok": False, "error_code": "INVALID_PROJECT_NAME"}
+    if session_key and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_key):
+        return {"ok": False, "error_code": "INVALID_SESSION_KEY"}
+    if __package__:
+        from .native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace
+    else:
+        from native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace
+    try:
+        with _mutex(BUS_DIR / "desktop_provision.mutex"):
+            return ensure_workspace(desktop_rpc(hub_name), Path(workspace), project_name.strip(), _workspace_from_uri, session_key)
+    except NativeDesktopError as error:
+        return error.result
+
+
+
+def tool_wake_desktop_workspace(workspace_path: str, project_id: str, conversation_id: str,
+                                request_id: str, model_id: str = "") -> Dict[str, Any]:
+    hub_name = os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB", "")
+    if not hub_name:
+        return {"ok": False, "error_code": "NATIVE_DESKTOP_PROTOTYPE_DISABLED"}
+    workspace = _existing_workspace(workspace_path)
+    if not workspace:
+        return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
+    if not (PROJECT_ID.fullmatch(project_id) and CONVERSATION_ID.fullmatch(conversation_id)
+            and REQUEST_ID.fullmatch(request_id)):
+        return {"ok": False, "error_code": "INVALID_NATIVE_REQUEST_TARGET"}
+    if __package__:
+        from .native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
+    else:
+        from native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
+    try:
+        with _mutex(BUS_DIR / "desktop_provision.mutex"):
+            return wake_workspace_request(desktop_rpc(hub_name), Path(workspace), project_id, conversation_id,
+                                          request_id, model_id, _workspace_from_uri)
+    except NativeDesktopError as error:
+        return error.result
+
+
+
 def tool_workspace_pair(
     action: str, workspace_path: str, conversation_id: str = "", project_id: str = "",
 ) -> Dict[str, Any]:
@@ -2001,6 +2048,35 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
 ]
 
 
+if os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB"):
+    CODEX_MCP_TOOLS.append({
+        "name": "agy_provision_desktop_workspace",
+        "description": "Experimental: create or reuse a local desktop project and its conversation. Verify both against the Antigravity host.",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workspace_path": {"type": "string"}, "project_name": {"type": "string"},
+                           "session_key": {"type": "string"}},
+            "required": ["workspace_path", "project_name"],
+            "additionalProperties": False,
+        },
+    })
+
+
+    CODEX_MCP_TOOLS.append({
+        "name": "agy_wake_desktop_workspace",
+        "description": "Experimental: wake an exact native desktop conversation so it can claim a queued bridge request.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {key: {"type": "string"} for key in (
+                "workspace_path", "project_id", "conversation_id", "request_id", "model_id"
+            )},
+            "required": ["workspace_path", "project_id", "conversation_id", "request_id"],
+            "additionalProperties": False,
+        },
+    })
+
+
 def _validate_args(tools: List[Dict[str, Any]], name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     schema = next((t["inputSchema"] for t in tools if t["name"] == name), None)
     if schema is None:
@@ -2070,6 +2146,12 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
         return tool_routing_settings(**args)
 
     if role == "codex":
+        if name == "agy_provision_desktop_workspace":
+            if not os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB"):
+                return {"ok": False, "error_code": "NATIVE_DESKTOP_PROTOTYPE_DISABLED"}
+            return tool_provision_desktop_workspace(args["workspace_path"], args["project_name"], args.get("session_key", ""))
+        if name == "agy_wake_desktop_workspace":
+            return tool_wake_desktop_workspace(**args)
         if name == "agy_workspace_pair":
             return tool_workspace_pair(**args)
         if name == "agy_cancel_guarded_review":

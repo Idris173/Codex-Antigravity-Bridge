@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import dataclass
 
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py",
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py", "native_desktop.py",
                 "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
