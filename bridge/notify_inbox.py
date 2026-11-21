@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 import bridge_server as bridge
 from bridge_server import (
@@ -37,76 +36,58 @@ def native_call(agentapi, *args):
     return response["response"]
 
 
-def _workspace_from_uri(uri):
-    parts = urlsplit(uri)
-    if parts.scheme != "file":
-        return None
-    path = unquote(parts.path)
-    if parts.netloc:
-        path = f"//{parts.netloc}{path}"
-    elif len(path) > 2 and path[0] == "/" and path[2] == ":":
-        path = path[1:]
-    return bridge._existing_workspace(path)
+def _verify_native_route(agentapi, key, route):
+    expected = route.get("expected_project_id", "")
+    if not bridge.PROJECT_ID.fullmatch(expected):
+        raise bridge.WorkspaceRouteError("ANTIGRAVITY_PROJECT_ID_REQUIRED")
+    if not bridge.CONVERSATION_ID.fullmatch(route["conversation_id"]):
+        raise bridge.WorkspaceRouteError("INVALID_CONVERSATION_ID")
+    bridge._verify_local_project(expected, key)
+    reply = native_call(agentapi, "get-conversation-metadata", route["conversation_id"])
+    meta = reply["conversationMetadata"]["metadata"]
+    project_id = str(meta.get("projectId", "")).lower()
+    if project_id != expected:
+        raise bridge.WorkspaceRouteError("ANTIGRAVITY_PROJECT_UNCONFIRMED")
+    roots = [bridge._workspace_from_uri(uri) for uri in meta.get("workspaceUris", []) if isinstance(uri, str)]
+    if not any(root and os.path.normcase(root) == key for root in roots):
+        raise bridge.WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
+    return project_id
+
+
+def _replace_route(key, route, current):
+    path = BUS_DIR / "workspace_routes.json"
+    with bridge._mutex(path.with_suffix(".mutex")):
+        routes = bridge._workspace_routes()
+        if routes.get(key) == route:
+            routes[key] = current
+            _atomic_write_json(path, routes)
 
 
 def reconcile_routes(agentapi):
-    path = BUS_DIR / "workspace_routes.json"
-    config_path = bridge.BASE_DIR.parent.parent / "config.json"
     for key, route in bridge._workspace_routes().items():
-        opening = route.get("open_attempt", {}).get("status") == "opening"
+        opening = route.get("open_attempt", {}).get("status") in ("opening", "creating")
         if route["status"] != "verifying" and not opening:
             continue
         current = dict(route)
-        try:
-            if opening:
-                settings = _read_json_safe(config_path) or {}
-                project = settings.get("sidecars", {}).get("chatgpt-bridge", {}).get("projectId")
-                if project != route["project_id"]:
-                    raise ValueError("ANTIGRAVITY_SIDECAR_PROJECT_MISMATCH")
-                # Reserve creation before crossing the native API. A restarted listener must not create a duplicate.
-                with bridge._mutex(path.with_suffix(".mutex")):
-                    routes = bridge._workspace_routes()
-                    if routes.get(key) != route:
-                        continue
-                    route = {**route, "open_attempt": {"status": "creating"}}
-                    routes[key] = route
-                    _atomic_write_json(path, routes)
-                reply = native_call(agentapi, "new-conversation", "--title=Codex paired workspace",
-                                    "This conversation was opened for a paired Codex workspace. Please wait for a request.")
-                current["conversation_id"] = reply["newConversation"]["conversationId"]
-                current["since_ms"] = int(time.time() * 1000)
-            conversation_id = current["conversation_id"]
-            if not bridge.CONVERSATION_ID.fullmatch(conversation_id):
-                raise ValueError("INVALID_CONVERSATION_ID")
-            reply = native_call(agentapi, "get-conversation-metadata", conversation_id)
-            meta = reply["conversationMetadata"]["metadata"]
-            roots = [_workspace_from_uri(uri) for uri in meta.get("workspaceUris", []) if isinstance(uri, str)]
-            if not any(root and os.path.normcase(root) == key for root in roots):
-                raise ValueError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
-            if current.get("project_id") and current["project_id"] != meta.get("projectId"):
-                raise ValueError("ANTIGRAVITY_PROJECT_UNCONFIRMED")
-            current.update(status="confirmed", project_id=meta.get("projectId", ""))
-            current.pop("error_code", None)
-            current.pop("open_attempt", None)
-        except ValueError as error:
-            reason = str(error)
-            current.update(status="blocked", error_code=reason if reason.isupper() else "ANTIGRAVITY_TARGET_UNCONFIRMED")
-        except (OSError, KeyError, subprocess.SubprocessError):
-            current.update(status="blocked", error_code="ANTIGRAVITY_TARGET_UNCONFIRMED")
-        if opening and current["status"] == "blocked":
-            current = {**route, "open_attempt": {"status": "blocked", "error_code": current["error_code"]}}
-        with bridge._mutex(path.with_suffix(".mutex")):
-            routes = bridge._workspace_routes()
-            if routes.get(key) == route:
-                routes[key] = current
-                _atomic_write_json(path, routes)
+        if opening:
+            current["open_attempt"] = {"status": "blocked", "error_code": bridge.NATIVE_PROJECT_SESSION_REQUIRED}
+        if route["status"] == "verifying":
+            try:
+                project_id = _verify_native_route(agentapi, key, route)
+                current.update(status="confirmed", project_id=project_id)
+                current.pop("error_code", None)
+            except bridge.WorkspaceRouteError as error:
+                current.update(status="blocked", error_code=str(error))
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                current.update(status="blocked", error_code="ANTIGRAVITY_TARGET_UNCONFIRMED")
+        _replace_route(key, route, current)
 
 
 def notify_pending(workspace, conversation_id, since_ms, agentapi):
-    routes = list(bridge._workspace_routes().values())
-    routes.append({"workspace_path": workspace, "conversation_id": conversation_id,
-                   "since_ms": since_ms, "status": "confirmed"})
-    routes.sort(key=lambda route: len(route["workspace_path"]), reverse=True)
+    project_routes = list(bridge._workspace_routes().values())
+    installed_root = bridge._existing_workspace(workspace) or os.path.abspath(workspace)
+    installed = {"workspace_path": installed_root, "conversation_id": conversation_id, "since_ms": since_ms}
+    routes = [*project_routes, installed]  # An explicit route wins if both roots match.
     pending = tool_check_codex_inbox()["pending_summaries"]
     previous = _read_json_safe(BUS_DIR / "antigravity_notifications.json") or {}
     previous_target = previous.get("target")
@@ -114,12 +95,16 @@ def notify_pending(workspace, conversation_id, since_ms, agentapi):
     attempted_conversations = set()
     for item in pending:
         request_id = item["request_id"]
-        route = next((entry for entry in routes
-                      if bridge.filter_submissions_by_workspace([item], entry["workspace_path"])), None)
-        if not route or route["status"] != "confirmed" or queued_at_ms(item) < route["since_ms"]:
+        candidates = project_routes if item.get("target_project_id") else routes
+        route = bridge._matching_workspace_route(item, candidates)
+        if not route or (route is not installed and not bridge._project_verified_route(route)):
+            continue
+        if queued_at_ms(item) < route["since_ms"]:
             continue
         cid = route["conversation_id"]
         if cid in attempted_conversations or (item.get("target_conversation_id") and item["target_conversation_id"] != cid):
+            continue
+        if item.get("target_project_id") and item["target_project_id"] != route.get("project_id"):
             continue
         path = BUS_DIR / "deliveries" / f"{request_id}.json"
         state = _read_json_safe(path) or {}
@@ -131,21 +116,28 @@ def notify_pending(workspace, conversation_id, since_ms, agentapi):
             f"Codex sent a request. Use chatgpt-bridge to claim {request_id} "
             "with bridge_claim_codex_request. If the tool returns the request, handle it within your "
             "current permissions and reply with bridge_reply_to_codex for the same request. "
-            "If model verification fails, stop and report the blocker."
-            if item.get("required_model")
+            "If verification fails, stop and report the blocker."
+            if item.get("target_conversation_id")
             else f"Codex sent a request. Read {request_id} using bridge_check_codex_inbox and "
                  "reply with bridge_reply_to_codex for the same request. If it is no longer pending, stop."
         )
         attempted_conversations.add(cid)
         try:
+            if route is not installed:
+                _verify_native_route(agentapi, os.path.normcase(route["workspace_path"]), route)
             response = native_call(agentapi, "send-message", cid, prompt)
             if response["sendMessage"]["recipientId"] != cid:
                 raise ValueError("Antigravity did not confirm the target")
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            code = "ANTIGRAVITY_NOTIFICATION_UNCONFIRMED"
+            if isinstance(error, bridge.WorkspaceRouteError):
+                code = str(error)
+                key = os.path.normcase(route["workspace_path"])
+                _replace_route(key, route, {**route, "status": "blocked", "error_code": code})
             with bridge._mutex(BUS_DIR / "replies.mutex"):
                 state = _read_json_safe(path) or {}
                 if not state.get("claimed_at"):
-                    state.update(status="notification_failed", error_code="ANTIGRAVITY_NOTIFICATION_UNCONFIRMED")
+                    state.update(status="notification_failed", error_code=code)
                     _atomic_write_json(path, state)
             continue
         with bridge._mutex(BUS_DIR / "replies.mutex"):

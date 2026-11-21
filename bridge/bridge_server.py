@@ -28,7 +28,8 @@ import uuid
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
@@ -52,6 +53,8 @@ LATEST_TO_CODEX_FILE = BUS_DIR / "to_codex_latest.json"
 REQUEST_ID = re.compile(r"req_[0-9]+_[0-9a-f]{6,32}")
 DISPATCH_ID = re.compile(r"[0-9a-f]{32}")
 CONVERSATION_ID = re.compile(r"[0-9a-zA-Z-]{32,128}")
+PROJECT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+NATIVE_PROJECT_SESSION_REQUIRED = "ANTIGRAVITY_NATIVE_PROJECT_SESSION_REQUIRED"
 MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,95}")
 
 _WARM_PS_PROC: Optional[subprocess.Popen] = None
@@ -1223,7 +1226,64 @@ def _workspace_routes() -> Dict[str, Any]:
     return _read_json_safe(BUS_DIR / "workspace_routes.json") or {}
 
 
-def tool_workspace_pair(action: str, workspace_path: str, conversation_id: str = "") -> Dict[str, Any]:
+def _matching_workspace_route(
+    submission: Dict[str, Any], routes: Iterable[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    return max(
+        (route for route in routes if filter_submissions_by_workspace([submission], route["workspace_path"])),
+        key=lambda route: len(route["workspace_path"]),
+        default=None,
+    )
+
+
+class WorkspaceRouteError(ValueError):
+    pass
+
+
+def _workspace_from_uri(uri: str) -> Optional[str]:
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return None
+    if parts.scheme != "file":
+        return None
+    path = unquote(parts.path)
+    if parts.netloc:
+        path = f"//{parts.netloc}{path}"
+    elif len(path) > 2 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return _existing_workspace(path)
+
+
+def _verify_local_project(project_id: str, workspace_key: str) -> None:
+    path = BASE_DIR.parent.parent / "projects" / f"{project_id}.json"
+    if not path.is_file():
+        return
+    project = _read_json_safe(path)
+    if not isinstance(project, dict) or str(project.get("id", "")).lower() != project_id:
+        raise WorkspaceRouteError("ANTIGRAVITY_PROJECT_UNCONFIRMED")
+    if "sidecar" in project or project.get("isWorkspaceOnly") is True:
+        raise WorkspaceRouteError("ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN")
+    container = project.get("projectResources")
+    resources = container.get("resources") if isinstance(container, dict) else None
+    if not isinstance(resources, list):
+        raise WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
+    for resource in resources:
+        uri = resource.get("folderUri") if isinstance(resource, dict) else None
+        root = _workspace_from_uri(uri) if isinstance(uri, str) else None
+        if root and os.path.normcase(root) == workspace_key:
+            return
+    raise WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
+
+
+def _project_verified_route(route: Dict[str, Any]) -> bool:
+    expected = route.get("expected_project_id", "")
+    return bool(expected and route.get("status") == "confirmed" and route.get("project_id") == expected)
+
+
+def tool_workspace_pair(
+    action: str, workspace_path: str, conversation_id: str = "", project_id: str = "",
+) -> Dict[str, Any]:
     workspace = _existing_workspace(workspace_path)
     if workspace is None:
         return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
@@ -1233,20 +1293,35 @@ def tool_workspace_pair(action: str, workspace_path: str, conversation_id: str =
         routes = _workspace_routes()
         route = routes.get(key)
         if action == "get":
+            if route and route["status"] == "confirmed" and not _project_verified_route(route):
+                route = {**route, "status": "blocked", "error_code": "ANTIGRAVITY_PROJECT_UNCONFIRMED"}
             return {"ok": True, "workspace_path": workspace, "route": route}
+        if action == "open":
+            confirmed_project = route["project_id"] if route and _project_verified_route(route) else ""
+            return {
+                "ok": False,
+                "error_code": NATIVE_PROJECT_SESSION_REQUIRED,
+                "workspace_path": workspace,
+                "project_id": confirmed_project,
+                "message": "Open a conversation in the intended native Antigravity project, then link it with both IDs.",
+            }
         if action == "link":
             if not CONVERSATION_ID.fullmatch(conversation_id):
                 return {"ok": False, "error_code": "INVALID_CONVERSATION_ID"}
-            if route and route.get("conversation_id") == conversation_id and route["status"] in ("confirmed", "verifying"):
+            if not PROJECT_ID.fullmatch(project_id):
+                return {"ok": False, "error_code": "ANTIGRAVITY_PROJECT_ID_REQUIRED"}
+            project_id = project_id.lower()
+            try:
+                _verify_local_project(project_id, key)
+            except WorkspaceRouteError as error:
+                return {"ok": False, "error_code": str(error)}
+            if (route and route.get("conversation_id") == conversation_id
+                    and route.get("expected_project_id") == project_id
+                    and (_project_verified_route(route) or route["status"] == "verifying")):
                 return {"ok": True, "route": route}
             route = {"workspace_path": workspace, "conversation_id": conversation_id,
-                     "status": "verifying", "since_ms": int(time.time() * 1000)}
-        elif action == "open":
-            if not route or route["status"] != "confirmed" or not route.get("project_id"):
-                return {"ok": False, "error_code": "ANTIGRAVITY_PROJECT_UNCONFIRMED"}
-            if route.get("open_attempt", {}).get("status") in ("opening", "creating"):
-                return {"ok": True, "route": route}
-            route = {**route, "open_attempt": {"status": "opening"}}
+                     "expected_project_id": project_id, "status": "verifying",
+                     "since_ms": int(time.time() * 1000)}
         else:
             return {"ok": False, "error_code": "INVALID_ACTION"}
         routes[key] = route
@@ -1268,11 +1343,11 @@ def _pending_request(request_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _visible_request(item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not item or not item.get("required_model"):
+    if not item or not (item.get("target_conversation_id") or item.get("required_model")):
         return item
     return {key: item.get(key) for key in (
         "request_id", "dispatch_id", "status", "submitted_at", "queued_at_ms", "workspace_path",
-        "target_conversation_id", "required_model",
+        "target_conversation_id", "target_project_id", "required_model",
     )}
 
 
@@ -1281,7 +1356,7 @@ def _delivery_status(request_id: str) -> Dict[str, Any]:
     return {key: value for key, value in saved.items() if key not in ("claim_proof", "reply_proof")}
 
 
-def _consume_model_proof(delivery: Dict[str, Any], purpose: str, proof: str) -> bool:
+def _valid_host_proof(delivery: Dict[str, Any], purpose: str, proof: str) -> bool:
     grant = delivery.get(f"{purpose}_proof", {})
     return bool(proof and grant.get("value") == proof and grant.get("expires_at", 0) >= time.time())
 
@@ -1295,10 +1370,17 @@ def tool_claim_codex_request(request_id: str, model_proof: str = "") -> Dict[str
             return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID"}
         state = _read_json_safe(_delivery_path(request_id)) or {}
         if not item.get("required_model"):
+            if item.get("target_conversation_id"):
+                if not _valid_host_proof(state, "claim", model_proof):
+                    return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNVERIFIED", "request_id": request_id}
+                state.pop("claim_proof", None)
+                state.setdefault("claimed_at", _now_iso())
+                state["status"] = "claimed"
+                _atomic_write_json(_delivery_path(request_id), state)
             return {"ok": True, "submission": item}
         if state.get("claimed_at"):
             return {"ok": False, "error_code": "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED"}
-        if not _consume_model_proof(state, "claim", model_proof):
+        if not _valid_host_proof(state, "claim", model_proof):
             return {"ok": False, "error_code": "ANTIGRAVITY_MODEL_UNVERIFIED", "request_id": request_id}
         active_path = _active_model_path(item["target_conversation_id"])
         if _active_guarded_request(item["target_conversation_id"]):
@@ -1383,7 +1465,8 @@ def tool_check_codex_inbox(request_id: str = "", workspace_path: str = "") -> Di
         "latest_pending": pending[-1] if pending else None,
         "pending_summaries": [
             {key: item.get(key, "") for key in ("request_id", "dispatch_id", "submitted_at", "queued_at_ms",
-                                               "workspace_path", "step_summary", "required_model", "target_conversation_id")}
+                                               "workspace_path", "step_summary", "required_model", "target_conversation_id",
+                                               "target_project_id")}
             for item in pending
         ],
         "pending_request_ids": [item["request_id"] for item in pending],
@@ -1435,8 +1518,10 @@ def tool_reply_to_codex(
 
         state = _read_json_safe(_delivery_path(req_id)) or {}
         if request.get("required_model"):
-            if not state.get("claimed_at") or not _consume_model_proof(state, "reply", model_proof):
+            if not state.get("claimed_at") or not _valid_host_proof(state, "reply", model_proof):
                 return {"ok": False, "error_code": "ANTIGRAVITY_MODEL_UNVERIFIED", "request_id": req_id}
+        elif request.get("target_conversation_id") and not _valid_host_proof(state, "reply", model_proof):
+            return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNVERIFIED", "request_id": req_id}
 
         reply_payload = {
             "ok": True,
@@ -1446,10 +1531,13 @@ def tool_reply_to_codex(
         }
         if request.get("dispatch_id"):
             reply_payload["dispatch_id"] = request["dispatch_id"]
+        if request.get("target_conversation_id"):
+            reply_payload["target_conversation_id"] = request["target_conversation_id"]
+        if request.get("target_project_id"):
+            reply_payload["target_project_id"] = request["target_project_id"]
         if request.get("required_model"):
             reply_payload["execution_model"] = state["execution_model"]
             reply_payload["reply_model"] = state["reply_proof"]["model"]
-            reply_payload["target_conversation_id"] = request["target_conversation_id"]
             reply_payload["required_model"] = request["required_model"]
         _atomic_write_json(path, reply_payload)
         _atomic_write_json(LATEST_TO_CODEX_FILE, reply_payload)
@@ -1545,16 +1633,19 @@ def codex_tool_submit_for_review(
     ):
         return {"ok": False, "error_code": "DISPATCH_WORKSPACE_MISMATCH", "dispatch_id": dispatch_id}
 
+    resolved_workspace = _existing_workspace(workspace_path or os.getcwd())
+    route = None
+    if resolved_workspace and not dispatch:
+        route = _matching_workspace_route({"workspace_path": resolved_workspace}, _workspace_routes().values())
+    if not dispatch and route and not _project_verified_route(route):
+        return {"ok": False, "error_code": route.get("error_code", "ANTIGRAVITY_PROJECT_UNCONFIRMED")}
     if required_model or target_conversation_id:
         if dispatch:
             return {"ok": False, "error_code": "MODEL_REQUIREMENT_NOT_SUPPORTED_FOR_DISPATCH_RECEIPTS"}
         if not MODEL_ID.fullmatch(required_model):
             return {"ok": False, "error_code": "INVALID_ANTIGRAVITY_MODEL"}
-        workspace = _existing_workspace(workspace_path)
-        route = _workspace_routes().get(os.path.normcase(workspace)) if workspace else None
-        if not route or route["status"] != "confirmed" or route["conversation_id"] != target_conversation_id:
+        if not workspace_path or not route or route["conversation_id"] != target_conversation_id:
             return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNCONFIRMED"}
-        workspace_path = workspace
 
     req_id = dispatch["request_id"] if dispatch else f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
     submission = {
@@ -1562,15 +1653,17 @@ def codex_tool_submit_for_review(
         "status": "pending",
         "submitted_at": _now_iso(),
         "queued_at_ms": int(time.time() * 1000),
-        "workspace_path": workspace_path or os.getcwd(),
+        "workspace_path": resolved_workspace or workspace_path or os.getcwd(),
         "step_summary": step_summary,
         "changed_files": changed_files,
         "code_or_diff": code_or_diff,
         "self_check": self_check,
         "open_questions": open_questions,
     }
+    if not dispatch and route:
+        submission.update(target_conversation_id=route["conversation_id"], target_project_id=route["project_id"])
     if required_model:
-        submission.update(required_model=required_model, target_conversation_id=target_conversation_id)
+        submission["required_model"] = required_model
     if dispatch:
         queued = _queue_dispatch_receipt(dispatch, submission)
         if not queued["ok"]:
@@ -1688,7 +1781,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "bridge_claim_codex_request",
-        "description": "按编号领取入箱任务。指定模型的任务只有在目标会话的宿主钩子确认模型后才返回正文。",
+        "description": "按编号领取入箱任务。已配对任务须由宿主钩子核验目标会话，指定模型的任务还须核验模型。",
         "inputSchema": {"type": "object", "properties": {
             "request_id": {"type": "string"},
             "model_proof": {"type": "string", "description": "由 Antigravity Hook 填充。"},
@@ -1791,7 +1884,7 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "bridge_check_codex_inbox",
-        "description": "读取 Codex 通过双边 MCP 主动发来的待评审代码包或请示消息。",
+        "description": "查看 Codex 收件箱。已配对任务仅显示摘要字段，正文通过 bridge_claim_codex_request 领取。",
         "inputSchema": {
             "type": "object",
             "properties": {"request_id": {"type": "string"}, "workspace_path": {"type": "string"}},
@@ -1823,11 +1916,12 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
     _routing_tool("agy_routing_settings"),
     {
         "name": "agy_workspace_pair",
-        "description": "按真实路径查询或登记 Antigravity 会话。link 等待宿主校验，open 尝试创建新会话，确认后才切换路由。get 的 route.open_attempt 提供创建进度或失败原因。",
+        "description": "按真实目录和原生项目 ID 配对已有 Antigravity 会话。link 需提供 project_id 与 conversation_id，get 查询宿主核验结果。open 返回原生项目会话要求。",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["get", "link", "open"]},
             "workspace_path": {"type": "string"},
             "conversation_id": {"type": "string"},
+            "project_id": {"type": "string", "description": "从预期 Antigravity 原生项目独立取得的项目 UUID。"},
         }, "required": ["action", "workspace_path"], "additionalProperties": False},
     },
     {

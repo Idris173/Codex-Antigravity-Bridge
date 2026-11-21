@@ -428,19 +428,20 @@ class BridgeLogicTests(TemporaryHomeTest):
 
         workspace = self.layout.home
         cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         request_id = "req_3_aabbcc"
         bridge = self.bridge
-        paired = bridge.tool_workspace_pair("link", str(workspace), cid)
+        paired = bridge.tool_workspace_pair("link", str(workspace), cid, project_id)
         self.assertEqual(paired["route"]["status"], "verifying")
         bridge._atomic_write_json(bridge._request_path(request_id), {
             "request_id": request_id, "status": "pending", "workspace_path": str(workspace),
             "queued_at_ms": paired["route"]["since_ms"] + 1,
         })
-        meta = {"conversationMetadata": {"metadata": {"workspaceUris": [workspace.as_uri()], "projectId": "project"}}}
+        meta = {"conversationMetadata": {"metadata": {"workspaceUris": [workspace.as_uri()], "projectId": project_id}}}
         with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
                                  tool_check_codex_inbox=bridge.tool_check_codex_inbox):
             with mock.patch.object(notify_inbox, "native_call", side_effect=[
-                meta, {"sendMessage": {"recipientId": cid}},
+                meta, meta, {"sendMessage": {"recipientId": cid}},
             ]):
                 notify_inbox.reconcile_routes("agentapi")
                 with redirect_stdout(io.StringIO()):
@@ -471,52 +472,172 @@ class BridgeLogicTests(TemporaryHomeTest):
                     self.assertEqual(notify_inbox.notify_pending(str(workspace), installed, 0, "agentapi"), request_id)
                 self.assertEqual(send.call_args.args[2], installed)
 
-    def test_open_keeps_confirmed_route_until_new_conversation_is_verified(self):
+    def test_open_blocks_legacy_creation_and_keeps_confirmed_route(self):
         from bridge import notify_inbox
 
         bridge = self.bridge
         workspace = self.layout.home
-        old = "12345678-1234-1234-1234-123456789abc"
-        new = "12345678-1234-1234-1234-123456789def"
-        bridge.tool_workspace_pair("link", str(workspace), old)
-        meta = {"conversationMetadata": {"metadata": {"workspaceUris": [workspace.as_uri()], "projectId": "project"}}}
-        creation = {"newConversation": {"conversationId": new}}
-        wrong_meta = {"conversationMetadata": {"metadata": {"workspaceUris": [], "projectId": "project"}}}
+        cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        route = {"workspace_path": str(workspace), "conversation_id": cid, "status": "confirmed",
+                 "project_id": project_id, "expected_project_id": project_id, "since_ms": 0}
+        key = os.path.normcase(str(workspace))
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
+            key: {**route, "open_attempt": {"status": "opening"}},
+        })
         with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
                                  tool_check_codex_inbox=bridge.tool_check_codex_inbox):
-            with mock.patch.object(notify_inbox, "native_call", side_effect=[
-                meta, creation, wrong_meta, creation, meta,
-            ]) as native:
+            with mock.patch.object(notify_inbox, "native_call") as native:
+                opening = bridge.tool_workspace_pair("open", str(workspace))
+                self.assertEqual(opening["error_code"], bridge.NATIVE_PROJECT_SESSION_REQUIRED)
+                self.assertEqual(opening["project_id"], project_id)
                 notify_inbox.reconcile_routes("agentapi")
-                existing = bridge.tool_workspace_pair("get", str(workspace))["route"]
-                opening = bridge.tool_workspace_pair("open", str(workspace))["route"]
-                self.assertEqual(opening, {**existing, "open_attempt": {"status": "opening"}})
-                self.assertEqual(bridge.tool_workspace_pair("open", str(workspace))["route"], opening)
-                notify_inbox.reconcile_routes("agentapi")
-                failed = bridge.tool_workspace_pair("get", str(workspace))["route"]
-                self.assertEqual(failed.pop("open_attempt"), {
-                    "status": "blocked", "error_code": "ANTIGRAVITY_SIDECAR_PROJECT_MISMATCH",
+                self.assertEqual(bridge.tool_workspace_pair("get", str(workspace))["route"], {
+                    **route, "open_attempt": {"status": "blocked", "error_code": bridge.NATIVE_PROJECT_SESSION_REQUIRED},
                 })
-                self.assertEqual(failed, existing)
-                self.assertEqual(native.call_count, 1)
+                native.assert_not_called()
 
-                bridge._atomic_write_json(bridge.BASE_DIR.parent.parent / "config.json", {
-                    "sidecars": {"chatgpt-bridge": {"projectId": "project"}},
-                })
-                bridge.tool_workspace_pair("open", str(workspace))
-                notify_inbox.reconcile_routes("agentapi")
-                failed = bridge.tool_workspace_pair("get", str(workspace))["route"]
-                self.assertEqual(failed.pop("open_attempt"), {
-                    "status": "blocked", "error_code": "ANTIGRAVITY_WORKSPACE_UNCONFIRMED",
-                })
-                self.assertEqual(failed, existing)
+    def test_pair_checks_project_and_directory_and_rechecks_before_delivery(self):
+        from bridge import notify_inbox
 
-                bridge.tool_workspace_pair("open", str(workspace))
+        bridge = self.bridge
+        workspace = self.layout.home
+        subfolder = workspace / "Source"
+        subfolder.mkdir()
+        cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        meta = {"workspaceUris": [workspace.as_uri()], "projectId": project_id}
+        wrong_project = {**meta, "projectId": "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"}
+        wrong_root = {**meta, "workspaceUris": []}
+        self.assertEqual(bridge.tool_workspace_pair("link", str(workspace), cid)["error_code"],
+                         "ANTIGRAVITY_PROJECT_ID_REQUIRED")
+        submit = {"workspace_path": str(subfolder), "step_summary": "Read-only test", "wait_for_reply": False}
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call") as native:
+                for metadata, code in [
+                    (wrong_project, "ANTIGRAVITY_PROJECT_UNCONFIRMED"),
+                    (wrong_root, "ANTIGRAVITY_WORKSPACE_UNCONFIRMED"),
+                    (meta, None),
+                ]:
+                    native.return_value = {"conversationMetadata": {"metadata": metadata}}
+                    bridge.tool_workspace_pair("link", str(workspace), cid, project_id)
+                    self.assertEqual(bridge.codex_tool_submit_for_review(**submit)["error_code"],
+                                     "ANTIGRAVITY_PROJECT_UNCONFIRMED")
+                    notify_inbox.reconcile_routes("agentapi")
+                    route = bridge.tool_workspace_pair("get", str(workspace))["route"]
+                    self.assertEqual(route.get("error_code"), code)
+                    if code:
+                        self.assertEqual(route["status"], "blocked")
+                        self.assertEqual(bridge.codex_tool_submit_for_review(**submit)["error_code"], code)
+                self.assertEqual(route["status"], "confirmed")
+                request_id = bridge.codex_tool_submit_for_review(**submit)["request_id"]
+                pending = bridge.tool_check_codex_inbox(request_id)["submission"]
+                self.assertEqual(pending["target_project_id"], project_id)
+                self.assertEqual(pending["target_conversation_id"], cid)
+                guarded = bridge.codex_tool_submit_for_review(**submit, required_model="gemini-4-neon",
+                                                              target_conversation_id=cid)
+                self.assertTrue(guarded["ok"])
+
+                native.reset_mock()
+                native.return_value = {"conversationMetadata": {"metadata": wrong_project}}
+                self.assertIsNone(notify_inbox.notify_pending(str(subfolder), cid, 0, "agentapi"))
+                self.assertIsNone(notify_inbox.notify_pending(str(subfolder), cid, 0, "agentapi"))
+                native.assert_called_once_with("agentapi", "get-conversation-metadata", cid)
+                self.assertEqual(bridge._delivery_status(request_id)["error_code"], "ANTIGRAVITY_PROJECT_UNCONFIRMED")
+                self.assertEqual(bridge.tool_workspace_pair("get", str(workspace))["route"]["status"], "blocked")
+                self.assertEqual(bridge.codex_tool_submit_for_review(**submit)["error_code"],
+                                 "ANTIGRAVITY_PROJECT_UNCONFIRMED")
+
+    def test_directory_only_route_blocks_the_installed_target_for_the_same_root(self):
+        from bridge import notify_inbox
+
+        bridge = self.bridge
+        workspace = self.layout.home
+        cid = "12345678-1234-1234-1234-123456789abc"
+        subfolder = workspace / "Source"
+        subfolder.mkdir()
+        queued = bridge.codex_tool_submit_for_review(step_summary="Before upgrade", workspace_path=str(subfolder),
+                                                     wait_for_reply=False)
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
+            os.path.normcase(str(workspace)): {"workspace_path": str(workspace), "conversation_id": cid,
+                                              "status": "confirmed", "since_ms": 0},
+        })
+        route = bridge.tool_workspace_pair("get", str(workspace))["route"]
+        self.assertEqual(route["status"], "blocked")
+        self.assertFalse(bridge.codex_tool_submit_for_review(step_summary="After upgrade", workspace_path=str(subfolder),
+                                                           wait_for_reply=False)["ok"])
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox):
+            with mock.patch.object(notify_inbox, "native_call") as native:
                 notify_inbox.reconcile_routes("agentapi")
-                opened = bridge.tool_workspace_pair("get", str(workspace))["route"]
-                self.assertEqual(opened["conversation_id"], new)
-                self.assertEqual(opened["status"], "confirmed")
-                self.assertNotIn("open_attempt", opened)
+                self.assertIsNone(notify_inbox.notify_pending(f"{workspace}{os.sep}.", cid, 0, "agentapi"))
+                native.assert_not_called()
+        self.assertFalse(bridge._delivery_status(queued["request_id"]))
+
+    def test_link_and_reconcile_reject_non_native_projects(self):
+        from bridge import notify_inbox
+
+        bridge = self.bridge
+        workspace = self.layout.home
+        cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        project_path = bridge.BASE_DIR.parent.parent / "projects" / f"{project_id}.json"
+        project = {"id": project_id, "projectResources": {"resources": [{"folderUri": workspace.as_uri()}]}}
+        sidecar = {**project, "sidecar": {"sidecarId": "duplicate"}}
+        for bad, error in (
+            (sidecar, "ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN"),
+            ({**project, "isWorkspaceOnly": True}, "ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN"),
+            ({**project, "projectResources": {"resources": []}}, "ANTIGRAVITY_WORKSPACE_UNCONFIRMED"),
+        ):
+            bridge._atomic_write_json(project_path, bad)
+            self.assertEqual(bridge.tool_workspace_pair("link", str(workspace), cid, project_id)["error_code"], error)
+        bridge._atomic_write_json(project_path, project)
+        self.assertTrue(bridge.tool_workspace_pair("link", str(workspace), cid, project_id)["ok"])
+        bridge._atomic_write_json(project_path, sidecar)
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge):
+            with mock.patch.object(notify_inbox, "native_call") as native:
+                notify_inbox.reconcile_routes("agentapi")
+                native.assert_not_called()
+        route = bridge.tool_workspace_pair("get", str(workspace))["route"]
+        self.assertEqual(route["status"], "blocked")
+        self.assertEqual(route["error_code"], "ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN")
+
+    def test_paired_request_requires_host_conversation_for_claim_and_reply(self):
+        from bridge import agy_model_guard as guard
+
+        bridge = self.bridge
+        workspace = self.layout.home
+        cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
+            os.path.normcase(str(workspace)): {"workspace_path": str(workspace), "conversation_id": cid,
+                                              "status": "confirmed", "since_ms": 0, "project_id": project_id,
+                                              "expected_project_id": project_id},
+        })
+        summary = "Payload for the paired conversation"
+        request_id = bridge.codex_tool_submit_for_review(step_summary=summary, workspace_path=str(workspace),
+                                                         wait_for_reply=False)["request_id"]
+        self.assertNotIn(summary, json.dumps(bridge.tool_check_codex_inbox(request_id)))
+        self.assertEqual(bridge.tool_claim_codex_request(request_id)["error_code"], "ANTIGRAVITY_TARGET_UNVERIFIED")
+        self.assertEqual(bridge.tool_reply_to_codex(request_id)["error_code"], "ANTIGRAVITY_TARGET_UNVERIFIED")
+        with mock.patch.object(guard, "bridge", bridge):
+            for tool in ("bridge_claim_codex_request", "bridge_reply_to_codex"):
+                event = {"conversationId": "another", "toolCall": {
+                    "name": f"mcp__chatgpt-bridge__{tool}", "args": {"request_id": request_id},
+                }}
+                self.assertEqual(guard.pre_tool(event)["reason"], "ANTIGRAVITY_TARGET_MISMATCH")
+            claim = guard.pre_tool({"conversationId": cid, "toolCall": {
+                "name": "mcp__chatgpt-bridge__bridge_claim_codex_request", "args": {"request_id": request_id},
+            }})["overwrite"]
+            self.assertEqual(bridge.tool_claim_codex_request(**claim)["submission"]["step_summary"], summary)
+            reply = guard.pre_tool({"conversationId": cid, "toolCall": {
+                "name": "mcp__chatgpt-bridge__bridge_reply_to_codex", "args": {},
+            }})["overwrite"]
+            self.assertTrue(bridge.tool_reply_to_codex(**reply)["ok"])
+        receipt = bridge.codex_tool_fetch_director_reply(request_id)
+        self.assertEqual(receipt["target_conversation_id"], cid)
+        self.assertEqual(receipt["target_project_id"], project_id)
 
     def test_model_guard_requires_host_proof_for_claim_and_reply(self):
         from bridge import agy_model_guard as guard, notify_inbox
@@ -524,12 +645,14 @@ class BridgeLogicTests(TemporaryHomeTest):
         bridge = self.bridge
         workspace = self.layout.home
         cid = "12345678-1234-1234-1234-123456789abc"
+        project_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         args = {"workspace_path": str(workspace), "required_model": "gemini-4-neon",
                 "target_conversation_id": cid, "step_summary": "Guarded task payload"}
         self.assertEqual(bridge.codex_tool_submit_for_review(**args)["error_code"], "ANTIGRAVITY_TARGET_UNCONFIRMED")
         bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {
             os.path.normcase(str(workspace)): {"workspace_path": str(workspace), "conversation_id": cid,
-                                              "status": "confirmed", "since_ms": 0},
+                                              "status": "confirmed", "since_ms": 0, "project_id": project_id,
+                                              "expected_project_id": project_id},
         })
         sent = bridge.codex_tool_submit_for_review(**args)
         request_id = sent["request_id"]

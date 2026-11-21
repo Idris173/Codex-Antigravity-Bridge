@@ -1,4 +1,4 @@
-"""Authorize guarded bridge tool calls using Antigravity's native hook metadata."""
+"""Authorize paired bridge tool calls using Antigravity's native hook metadata."""
 
 import json
 import re
@@ -75,27 +75,28 @@ def pre_tool(event):
                 if len(pending) == 1:
                     request_id = pending[0]["request_id"]
         item = bridge._pending_request(request_id)
-        if not item or not item.get("required_model"):
+        if not item or not item.get("target_conversation_id"):
             return {"decision": "allow"}
         if event.get("conversationId") != item["target_conversation_id"]:
             return {"decision": "deny", "reason": "ANTIGRAVITY_TARGET_MISMATCH"}
         path = bridge._delivery_path(request_id)
         state = bridge._read_json_safe(path) or {}
-        if purpose == "claim":
-            if state.get("claimed_at"):
-                return {"decision": "deny", "reason": "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED"}
-            if bridge._active_guarded_request(item["target_conversation_id"]):
-                return {"decision": "deny", "reason": "ANTIGRAVITY_CONVERSATION_BUSY"}
-        code = _observe(item, state, event.get("modelName"))
-        if code:
-            bridge._atomic_write_json(path, state)
-            return {"decision": "deny", "reason": code}
-        state.pop("error_code", None)
-        state["status"] = "claimed" if state.get("claimed_at") else "model_verified"
         proof = uuid.uuid4().hex
-        state[f"{purpose}_proof"] = {
-            "value": proof, "model": event["modelName"], "expires_at": time.time() + 120,
-        }
+        grant = {"value": proof, "expires_at": time.time() + 120}
+        if item.get("required_model"):
+            if purpose == "claim":
+                if state.get("claimed_at"):
+                    return {"decision": "deny", "reason": "ANTIGRAVITY_REQUEST_ALREADY_CLAIMED"}
+                if bridge._active_guarded_request(item["target_conversation_id"]):
+                    return {"decision": "deny", "reason": "ANTIGRAVITY_CONVERSATION_BUSY"}
+            code = _observe(item, state, event.get("modelName"))
+            if code:
+                bridge._atomic_write_json(path, state)
+                return {"decision": "deny", "reason": code}
+            state.pop("error_code", None)
+            state["status"] = "claimed" if state.get("claimed_at") else "model_verified"
+            grant["model"] = event["modelName"]
+        state[f"{purpose}_proof"] = grant
         bridge._atomic_write_json(path, state)
     changes = {"request_id": request_id, "model_proof": proof}
     if wrapper:

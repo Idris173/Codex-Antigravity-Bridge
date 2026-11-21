@@ -140,9 +140,9 @@ From Antigravity, read pending submissions (optionally scoped by `workspace_path
 }
 ```
 
-> When more than one request is pending in the inbox, passing `request_id` to `bridge_reply_to_codex` is required so replies never target the wrong submission.
+> For a paired request, claim the full request through `bridge_claim_codex_request` in the target Antigravity conversation before replying. The host hook verifies who claims and replies. When more than one request is pending, pass the same `request_id` to both tools.
 
-You can also inspect, wait on, or reply to inbox requests from the CLI:
+You can also inspect or wait on inbox requests from the CLI, and reply to unpaired requests:
 
 ```powershell
 # Wait only for new submissions arriving after the listener starts
@@ -181,16 +181,16 @@ By default, inbox checks are on-demand or polled via `cli wait_inbox`. If you wa
 2. **Requirements & Behavior**:
    - Configures `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json`, enables `sidecars.chatgpt-bridge` in `~/.gemini/config/config.json`, and registers the `codex-antigravity-bridge-model` lifecycle hook in `~/.gemini/config/hooks.json` (`--doctor` verifies this hook when the sidecar is present).
    - Uses Antigravity's sidecar `agentapi send-message` (requires `agentapi` on the Antigravity sidecar `PATH`) to notify `<conversation-id>` when a new eligible `request_id` arrives for that workspace.
-   - Use `bridge_check_codex_inbox` to read ordinary requests and `bridge_claim_codex_request` to claim requests that require a model. Reply to either through `bridge_reply_to_codex` under the conversation's existing permissions.
+   - Use `bridge_check_codex_inbox` to inspect requests and `bridge_claim_codex_request` to claim the full text of a paired request. Reply through `bridge_reply_to_codex` using the same request ID.
    - Restart Antigravity if the sidecar or hook does not load immediately after the configuration change.
    - To pause automatic notifications, set `sidecars.chatgpt-bridge.enabled` to `false` in `~/.gemini/config/config.json`.
 
 ### Pair a Workspace
 
 - **Codex → Antigravity (`agy_workspace_pair`)**:
-  1. Ensure the target folder is open as a workspace/project in Antigravity, then call `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", conversation_id="<conversation_id>")`.
-  2. Poll `agy_workspace_pair(action="get", workspace_path="C:/path/to/workspace")` until `route.status` is `"confirmed"` via native `agentapi get-conversation-metadata`. Multiple confirmed folders can route to separate Antigravity conversations.
-  3. Calling `action="open"` attempts to create a new paired Antigravity conversation only when `route.project_id` is confirmed and matches `sidecars.chatgpt-bridge.projectId` in `~/.gemini/config/config.json` (not set by default during standard `--agy-conversation-id` install). The existing `"confirmed"` route continues receiving requests while `route.open_attempt` reports `"opening"`, `"creating"`, or `"blocked"` (`error_code`), and switches only after the new conversation's workspace metadata is verified.
+  1. Identify the intended native Antigravity project by its name and the resolved Codex project root. Get the project UUID from the intended project, then select a conversation within it.
+  2. Call `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", project_id="<project_uuid>", conversation_id="<conversation_id>")`. Check with `action="get"` that `route.status` is `"confirmed"` and both IDs match. The Sidecar checks the project UUID and resolved root at pairing and again before delivery. Subdirectories inherit the most specific paired route. Relink any older routes that were verified by folder alone.
+  3. For desktop bridging, open a conversation in the intended Antigravity desktop project and send a first message before linking. In the Windows setup tested here, `agy --project=<project_uuid>` creates a CLI conversation in separate `antigravity-cli` storage that the Desktop Sidecar cannot read. The bridge's `action="open"` returns `ANTIGRAVITY_NATIVE_PROJECT_SESSION_REQUIRED`. If the project is missing and no verified creation path is available, create it with the matching name and root first. After linking, check the project and conversation IDs in the reply for the same request. [Antigravity project documentation](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
 - **Antigravity → Codex (`bridge_bind_session`)**:
   1. Call `bridge_bind_session(workspace_path="C:/path/to/workspace", reuse_workspace_binding=true)` to reuse an active headless `codex_exec` binding for the same resolved folder.
   2. Optionally pass `ensure_codex_project=true` to reuse or create a sidebar project via the experimental Codex App Server (`project` status on bind, `project_attachment` on the completed run). If the experimental API is unavailable, headless execution still runs in `workspace_path`.
@@ -203,7 +203,7 @@ By default, inbox checks are on-demand or polled via `cli wait_inbox`. If you wa
 | **Codex headless binding (`codex_exec`)** | `bridge_codex_session_model(binding_id, action="get" \| "set", model="<slug>")` (or initial `codex_model` on `bridge_bind_session`) | Applies to the **next headless turn** (`codex.exe exec` / `exec resume`), preserving session history across model changes and reporting `next_model`, `last_dispatched_model`, and `last_observed_model`. Does **not** alter a turn already in progress. |
 | **Codex desktop window (`uia`)** | Not supported via bridge (`CODEX_DESKTOP_MODEL_NOT_SUPPORTED`) | The bridge cannot remotely change the ChatGPT/Codex desktop app's model picker. *(Host-native Codex CLI / App Server session APIs exist independently of this bridge's desktop UIA mode.)* |
 | **Antigravity existing conversation** | Request a model switch through the conversation's built-in Swarm tool, then require the model through `agy_submit_for_review` | The conversation keeps its ID and context. The host hook checks the conversation and actual model at both claim and reply. Use the required model to resume a blocked request or cancel it from Codex. |
-| **Antigravity new conversation** | Host-native `agentapi new-conversation --model=<model_id>` | Tested locally with `gemini-4-neon-medium`. The host falls back to the `flash` tier if the requested model is unavailable. The bridge's `agy_workspace_pair(action="open")` has no `model` parameter. |
+| **Antigravity new conversation** | Select a model in the intended Antigravity project | Link the conversation after creation using the native project UUID and conversation ID. |
 
 #### Switch the model of an existing Antigravity conversation
 

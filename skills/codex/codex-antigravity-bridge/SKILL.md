@@ -47,7 +47,10 @@ description: >-
 当需要主动向 Antigravity（反重力）发指令、提交评审或汇报结果时，**必须使用 `antigravity_bridge` MCP 工具**，严禁使用 `computer-use` 截图、移动鼠标或模拟键盘输入：
 
 - 把用户的自然语言意图传给 `agy_submit_for_review`，设 `wait_for_reply=false`，把返回的 `request_id` 留给工具调用。用 `agy_fetch_director_reply` 询问同一请求的投递状态与结果。
-- 用 `agy_workspace_pair(action="link")` 按已有 Antigravity 会话 ID 配对实际目录，等 `get` 确认后复用。用户要求在已配对项目中开新会话时用 `open`，并在同一工作区核对结果。缺少项目或目录验证时告诉用户具体原因。
+- 当用户指定 Antigravity 工程时，先确定 Codex 工程的真实根目录和名称，再找到同一根目录、对应名称的 Antigravity 原生项目。从该项目独立取得预期项目 UUID。候选会话返回的项目 ID 只用于比对，不能反填成预期 ID。
+- 桌面桥接要使用原生桌面会话。已实测 Windows 的 `agy --project=<project_uuid>` 能在指定项目下新建 CLI 会话，但会话存储在独立的 `antigravity-cli` 目录，桌面 Sidecar 无法读取该会话。请用户在正式项目里手动新开桌面会话、发送首条消息并提供会话 ID。项目尚不存在且缺少已验证的创建路径时，请用户先用对应名称和同一根目录创建项目。桥接的 `open` 会返回会话要求。禁止创建替代 Sidecar 项目或用 UI 驱动代办。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
+- 用 `agy_workspace_pair(action="link", workspace_path=..., project_id=..., conversation_id=...)` 登记会话。`get` 显示 `route.status="confirmed"` 且项目与会话 ID 均符合预期后，才可提交该项目的请求。旧配对若只校验过目录，须重新 `link`。
+- 用同一 `request_id` 核对目标会话回执中的项目和会话 ID。宿主钩子会在领取正文和写回回执时核验会话身份。
 - 用户指定必须使用的 Antigravity 模型时，将 `required_model` 和已确认的 `target_conversation_id` 作为工具参数。路由偏好不代表实际执行。只有宿主确认后任务正文才可领取。发现模型不符时保留等待状态并汇报，用户要求取消时调用 `agy_cancel_guarded_review`。
 
 ### 切换 Antigravity 已有桌面会话的模型

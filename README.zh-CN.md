@@ -140,9 +140,9 @@ Codex 调用 `antigravity_bridge` MCP 服务中的 `agy_submit_for_review`（在
 }
 ```
 
-> 当收件箱中同时存在多张待处理单据时，`bridge_reply_to_codex` 必须显式指定 `request_id`，以防误回其他单据。
+> 已配对的请求需要在目标 Antigravity 会话用 `bridge_claim_codex_request` 领取正文，再写回回执。宿主钩子会核验领取与回执的会话。收件箱有多张待处理单据时，两次调用都要传入同一 `request_id`。
 
-也可以使用命令行子命令执行监听、查看与按 `request_id` 回执：
+也可以通过命令行监听或查看收件箱，并按 `request_id` 回复未配对的请求：
 
 ```powershell
 # 仅等待监听启动之后新到达的提交
@@ -181,16 +181,16 @@ python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli reply
 2. **适用条件与运行机制**：
    - 安装器会写入 `~/.gemini/config/sidecars/chatgpt-bridge/sidecar.json`、在 `~/.gemini/config/config.json` 中启用 `sidecars.chatgpt-bridge`，并在 `~/.gemini/config/hooks.json` 中注册 `codex-antigravity-bridge-model` 生命周期钩子（存在 Sidecar 时 `--doctor` 会同步校验该钩子）。
    - 该功能依赖 Antigravity Sidecar 运行环境 `PATH` 中的 `agentapi` 命令；当该工作区到达新的待处理 `request_id` 时，后台监听器通过 `agentapi send-message <conversation-id> ...` 通知目标会话。
-   - 普通请求通过 `bridge_check_codex_inbox` 读取，指定模型的受保护请求通过 `bridge_claim_codex_request` 领取，并在会话现有权限范围内调用 `bridge_reply_to_codex` 按原 `request_id` 回复。
+   - 用 `bridge_check_codex_inbox` 查看收件箱，用 `bridge_claim_codex_request` 领取已配对请求的正文，再通过 `bridge_reply_to_codex` 按原 `request_id` 回复。
    - 若修改配置后 Sidecar 或钩子未立即生效，请重启一次 Antigravity。
    - 如需暂停自动通知，将 `~/.gemini/config/config.json` 中的 `sidecars.chatgpt-bridge.enabled` 设为 `false` 即可。
 
 ### 配对工作区
 
 - **Codex → Antigravity（`agy_workspace_pair`）**：
-  1. 先确保目标文件夹已在 Antigravity 中作为工作区/项目打开，然后调用 `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", conversation_id="<conversation_id>")`。
-  2. 调用 `agy_workspace_pair(action="get", workspace_path="C:/path/to/workspace")` 查询状态，直至原生 `agentapi get-conversation-metadata` 核验目录通过并变为 `route.status == "confirmed"`。多个已确认目录可分别路由到各自的 Antigravity 会话。
-  3. 调用 `action="open"` 尝试新建配对会话时，要求 `route.project_id` 已确认且与 `~/.gemini/config/config.json` 中 `sidecars.chatgpt-bridge.projectId` 一致（标准 `--agy-conversation-id` 安装默认不写入 `projectId`）。创建期间原 `"confirmed"` 路由保持收件不中断，可通过 `action="get"` 的 `route.open_attempt` 查看进度（`"opening"` / `"creating"`）或失败原因（`"blocked"` 与 `error_code`），仅在新会话通过目录与项目核验后切换。
+  1. 按项目名称和 Codex 工程的真实根目录确定目标 Antigravity 原生项目。从目标项目取得原生项目 UUID，再选择该项目内的会话。
+  2. 调用 `agy_workspace_pair(action="link", workspace_path="C:/path/to/workspace", project_id="<project_uuid>", conversation_id="<conversation_id>")`。用 `action="get"` 确认 `route.status` 为 `"confirmed"` 且两个 ID 均符合预期。Sidecar 在配对和投递前核验项目 UUID 和真实根目录，子目录使用最具体的配对路由。原来只校验过目录的配对需要重新登记。
+  3. 使用桌面桥接时，先在目标 Antigravity 桌面项目中开启会话并发送首条消息。本机实测 `agy --project=<project_uuid>` 创建的 CLI 会话使用独立的 `antigravity-cli` 存储，桌面 Sidecar 无法读取。桥接的 `action="open"` 会返回 `ANTIGRAVITY_NATIVE_PROJECT_SESSION_REQUIRED`。项目不存在且缺少已验证的创建路径时，先用对应名称和同一根目录手动创建项目。配对后核对同一请求回执的项目与会话 ID。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
 - **Antigravity → Codex（`bridge_bind_session`）**：
   1. 调用 `bridge_bind_session(workspace_path="C:/path/to/workspace", reuse_workspace_binding=true)` 可按规范化真实路径复用已有的无头 `codex_exec` 会话绑定。
   2. 可选传入 `ensure_codex_project=true`，通过实验版 Codex App Server 复用或创建桌面侧边栏项目（绑定时返回 `project` 状态，首轮完成后在运行记录中写入 `project_attachment`）；若实验接口不可用，无头任务仍正常在 `workspace_path` 内执行。
@@ -203,7 +203,7 @@ python "$HOME\.gemini\config\sidecars\chatgpt-bridge\bridge_server.py" cli reply
 | **Codex 无头绑定（`codex_exec`）** | `bridge_codex_session_model(binding_id, action="get" \| "set", model="<slug>")`（或绑定时传 `codex_model`） | 作用于该绑定的**下一轮无头执行**（`codex.exe exec` / `exec resume`），续接同一会话时保留上下文，并返回 `next_model`、`last_dispatched_model` 与 `last_observed_model`。**无法**改变正在运行中的轮次。 |
 | **Codex 桌面窗口（`uia`）** | 本桥接工具不支持（返回 `CODEX_DESKTOP_MODEL_NOT_SUPPORTED`） | 无法通过本桥接工具远程修改 ChatGPT / Codex 桌面窗口的模型选择器。*（Codex 原生 CLI / App Server 自身的会话接口属于宿主独立能力，独立于本仓库桌面 UIA 模式。）* |
 | **Antigravity 已有会话** | 通过会话内置的 Swarm 切换模型，再通过 `agy_submit_for_review` 要求使用该模型 | 保留原会话 ID 与上下文。宿主钩子在领取和回执时都核验会话与实际模型。请求因模型不符而阻塞时，可用指定模型恢复，也可从 Codex 取消。 |
-| **Antigravity 新建会话** | 宿主原生 `agentapi new-conversation --model=<model_id>` | 本机已用 `gemini-4-neon-medium` 验证。目标模型不可用时宿主会回退至 `flash` 档。桥接工具 `agy_workspace_pair(action="open")` 没有 `model` 参数。 |
+| **Antigravity 新建会话** | 在目标 Antigravity 项目中选择模型 | 新会话创建后，使用原生项目 UUID 与会话 ID 配对。 |
 
 #### 切换 Antigravity 已有会话的模型
 

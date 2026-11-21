@@ -54,12 +54,14 @@ description: >-
 
 ### 路径 D：接收与批复 Codex 侧反向 MCP 提交（零 `computer-use` 全双工总线）
 - Codex 侧已注册反向 MCP 服务 `antigravity_bridge`，可通过 `agy_submit_for_review` 向本地共享总线投递待审代码或请示。
-- 调用 `bridge_check_codex_inbox` 获取待审摘要，可传 `workspace_path` 按工程筛选。审查后将该单 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。有多张待审单时必须指定编号。
-- 要求特定 Antigravity 模型的请求通过 `bridge_claim_codex_request` 领取。该工具依赖宿主检查会话 ID 和调用模型。工具报告未核验或不符时停止，不取用任务正文或回执。通过检查再处理，并按同一编号回执。
+- 调用 `bridge_check_codex_inbox` 查看收件箱，可传 `workspace_path` 按工程筛选。收到已配对请求时，用 `bridge_claim_codex_request` 领取正文。审查后将同一 `request_id` 连同结论和下一步指令传给 `bridge_reply_to_codex`。
+- 处理原生项目配对请求时，先独立确定目标项目名称、真实根目录与原生项目 UUID，再查宿主返回的会话归属。对带 `target_project_id` 和 `target_conversation_id` 的请求，只有当前会话的宿主元数据同时吻合这两个 ID 和工程根目录才处理，并用同一 `request_id` 回执。无法取得归属证据或发现不符时停止处理并报告原因。
+- 桌面桥接要使用原生桌面会话。已实测 Windows 的 `agy --project=<project_uuid>` 新建的会话使用独立的 `antigravity-cli` 存储，桌面 Sidecar 无法读取。请用户在原生项目中手动新开桌面会话并发送首条消息。项目尚不存在且缺少已验证的创建路径时，请用户先用对应名称和同一根目录创建项目。保留原会话，不使用 UI 驱动或额外 Sidecar 项目代替。[Antigravity 官方项目文档](https://antigravity.google/docs/projects#opening-a-session-in-a-specific-project)
+- 宿主钩子会核验领取和回执的目标会话。若请求指定了模型，钩子还会核验实际调用的模型。核验失败时停止处理并报告原因。
 
 ### 接收已有桌面会话的切模请求
 
-1. 通过 `bridge_check_codex_inbox` 读取普通切模请求。核对用户明确授权、当前会话 ID 与请求目标，以及准确模型 ID。必要时用内置 `swarm(action="models", all=true)` 检查模型可用性。遇到目标不符或模型不可用时按原编号回告原因。
+1. 通过 `bridge_claim_codex_request` 领取发给当前配对会话的切模请求。核对用户明确授权和准确模型 ID。必要时用内置 `swarm(action="models", all=true)` 检查模型可用性。遇到目标不符或模型不可用时报告原因。
 2. 用 `swarm(action="status")` 检查当前会话。尚无 Swarm 时，用 `swarm(action="title", title="Model selection")` 创建看板并初始化当前会话的协调者，无需调用 `add`。已有 Swarm 时，只有确认当前会话是该协调者才能继续。使用 `swarm(action="model", name="coordinator", model=...)` 切换自身，按原 `request_id` 用 `bridge_reply_to_codex` 回告工具的实际结果。
 3. 切模回执只记录工具结果。等 Codex 发来单独的指定模型任务，再经 `bridge_claim_codex_request` 由宿主检查实际模型。
 - 用 `bridge_server.py cli wait_inbox --timeout 600 --only-new` 等待监听开始后的新提交。脚本位于 `~/.gemini/config/sidecars/chatgpt-bridge/bridge_server.py`。
