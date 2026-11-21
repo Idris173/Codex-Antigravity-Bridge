@@ -11,6 +11,10 @@ import time
 from pathlib import Path
 
 import bridge_server as bridge
+if __package__:
+    from .native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
+else:
+    from native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
 from bridge_server import (
     BUS_DIR,
     _atomic_write_json,
@@ -83,6 +87,37 @@ def reconcile_routes(agentapi):
         _replace_route(key, route, current)
 
 
+def _auto_wake(item, route, path):
+    """Own the auto-wake attempt once so an unknown execution result is not retried."""
+    request_id = item["request_id"]
+
+    def before_send():
+        with bridge._mutex(BUS_DIR / "replies.mutex"):
+            state = _read_json_safe(path) or {}
+            if (state.get("auto_wake_started_at") or state.get("notified_at") or state.get("claimed_at")
+                    or not bridge._pending_request(request_id)):
+                return False
+            state.update(auto_wake_started_at=bridge._now_iso(), auto_wake_status="starting")
+            _atomic_write_json(path, state)
+            return True
+
+    with bridge._mutex(BUS_DIR / "desktop_provision.mutex"):
+        state = _read_json_safe(path) or {}
+        if state.get("auto_wake_started_at") or state.get("notified_at") or state.get("claimed_at"):
+            return "skip"
+        response = wake_workspace_request(
+            desktop_rpc(item["desktop_hub"]), Path(route["workspace_path"]), route["project_id"],
+            route["conversation_id"], request_id, "", bridge._workspace_from_uri, blank_only=True,
+            required_model=item.get("required_model", ""), before_send=before_send,
+        )
+        if response["status"] in ("sent", "already_notified"):
+            with bridge._mutex(BUS_DIR / "replies.mutex"):
+                state = _read_json_safe(path) or {}
+                state["auto_wake_status"] = response["status"]
+                _atomic_write_json(path, state)
+        return response["status"]
+
+
 def notify_pending(workspace, conversation_id, since_ms, agentapi):
     project_routes = list(bridge._workspace_routes().values())
     installed_root = bridge._existing_workspace(workspace) or os.path.abspath(workspace)
@@ -108,7 +143,7 @@ def notify_pending(workspace, conversation_id, since_ms, agentapi):
             continue
         path = BUS_DIR / "deliveries" / f"{request_id}.json"
         state = _read_json_safe(path) or {}
-        if state.get("notified_at") or state.get("claimed_at"):
+        if state.get("notified_at") or state.get("claimed_at") or state.get("auto_wake_started_at"):
             continue
         if previous_target == [workspace, cid, since_ms] and request_id in previous.get("sent", []):
             continue
@@ -121,15 +156,25 @@ def notify_pending(workspace, conversation_id, since_ms, agentapi):
             else f"Codex sent a request. Read {request_id} using bridge_check_codex_inbox and "
                  "reply with bridge_reply_to_codex for the same request. If it is no longer pending, stop."
         )
+        attempt = bridge._pending_request(request_id)
+        if not attempt:
+            continue
+        auto_wake = attempt.get("auto_wake_blank") is True and route is not installed
         attempted_conversations.add(cid)
         try:
             if route is not installed:
                 _verify_native_route(agentapi, os.path.normcase(route["workspace_path"]), route)
-            response = native_call(agentapi, "send-message", cid, prompt)
-            if response["sendMessage"]["recipientId"] != cid:
-                raise ValueError("Antigravity did not confirm the target")
+            wake = _auto_wake(attempt, route, path) if auto_wake else "not_blank"
+            if wake == "skip":
+                continue
+            if wake == "not_blank":
+                response = native_call(agentapi, "send-message", cid, prompt)
+                if response["sendMessage"]["recipientId"] != cid:
+                    raise ValueError("Antigravity did not confirm the target")
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             code = "ANTIGRAVITY_NOTIFICATION_UNCONFIRMED"
+            if isinstance(error, NativeDesktopError):
+                code = error.result["error_code"]
             if isinstance(error, bridge.WorkspaceRouteError):
                 code = str(error)
                 key = os.path.normcase(route["workspace_path"])
@@ -138,6 +183,8 @@ def notify_pending(workspace, conversation_id, since_ms, agentapi):
                 state = _read_json_safe(path) or {}
                 if not state.get("claimed_at"):
                     state.update(status="notification_failed", error_code=code)
+                    if state.get("auto_wake_started_at"):
+                        state["auto_wake_status"] = "failed"
                     _atomic_write_json(path, state)
             continue
         with bridge._mutex(BUS_DIR / "replies.mutex"):

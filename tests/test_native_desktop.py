@@ -1,11 +1,14 @@
 """Regression coverage for opt-in Antigravity desktop provisioning."""
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 from uuid import uuid4
 
-from bridge.native_desktop import NativeDesktopError, ensure_workspace, wake_workspace_request
+from bridge import native_desktop
+from bridge.native_desktop import NativeDesktopError, ensure_workspace, resolve_model, wake_workspace_request
 
 
 class DesktopHost:
@@ -107,6 +110,26 @@ class DesktopProvisionTests(unittest.TestCase):
         self.assertEqual(planner["planModel"], "MODEL_CARBON")
         self.assertEqual(planner["requestedModel"], {"model": "MODEL_CARBON"})
 
+    def test_multi_root_wake_uses_a_matching_workspace_and_requires_original_model(self):
+        result = self.provision()
+        conversation_id = result["conversation_id"]
+        self.host.conversations[conversation_id]["workspaceUris"].insert(0, (self.workspace / "other").as_uri())
+        resolver = lambda uri: str(self.workspace) if uri == self.workspace.as_uri() else None
+        args = (self.host, self.workspace, result["project_id"].upper(), conversation_id, "req_123456_abcdef")
+        before_send = mock.Mock(return_value=True)
+        with self.assertRaises(NativeDesktopError) as error:
+            wake_workspace_request(*args, "gemini-4-carbon-low", resolver,
+                                   required_model="gemini-4-carbon-high", before_send=before_send)
+        self.assertEqual(error.exception.result["error_code"], "ANTIGRAVITY_MODEL_MISMATCH")
+        before_send.assert_not_called()
+        before_send.return_value = False
+        self.assertEqual(wake_workspace_request(*args, "", resolver, required_model="gemini-4-carbon-low",
+                                               before_send=before_send)["status"], "skip")
+        self.assertFalse(self.host.inputs)
+        before_send.return_value = True
+        self.assertEqual(wake_workspace_request(*args, "", resolver, required_model="gemini-4-carbon-low",
+                                               before_send=before_send)["status"], "sent")
+
     def test_does_not_reuse_an_unrelated_same_name(self):
         other = str(uuid4())
         self.host.projects[other] = {
@@ -125,6 +148,49 @@ class DesktopProvisionTests(unittest.TestCase):
             self.assertEqual(failure.exception.result["error_code"], "NATIVE_CONVERSATION_UNCONFIRMED")
         self.assertEqual(len(self.host.projects), 1)
         self.assertEqual(len(self.host.conversations), 1)
+
+    def test_hub_auto_never_selects_an_arbitrary_live_candidate(self):
+        for port in (4000, 4001, 4002):
+            (self.workspace / f"hub_{port}.json").touch()
+        live = mock.Mock(return_value={"projectIds": ["fixture"]})
+        with mock.patch.object(native_desktop, "_hub_rpc", return_value=live) as connection:
+            with self.assertRaises(NativeDesktopError) as error:
+                native_desktop._hub_candidates(self.workspace, {4001: 7, 4002: 8})
+            self.assertEqual(error.exception.result["error_code"], "DESKTOP_HUB_AMBIGUOUS")
+            paths = [call.args[0].name for call in connection.call_args_list]
+            self.assertEqual(paths, ["hub_4001.json", "hub_4002.json"])
+
+    def test_explicit_hub_checks_pid_before_building_a_connection(self):
+        home = self.workspace
+        daemon = home / ".gemini" / "antigravity" / "daemon"
+        daemon.mkdir(parents=True)
+        (daemon / "hub_4000.json").write_text(json.dumps({
+            "httpPort": 4000, "pid": 123, "csrfToken": "fixture-value",
+        }), encoding="utf-8")
+        with mock.patch.object(native_desktop.Path, "home", return_value=home), \
+                mock.patch.object(native_desktop, "_desktop_loopback_owners") as owners, \
+                mock.patch.object(native_desktop, "build_opener") as build_opener:
+            for listeners in ({}, {4000: 124}):
+                owners.return_value = listeners
+                with self.assertRaises(NativeDesktopError) as error:
+                    native_desktop.desktop_rpc("hub_4000.json")
+                self.assertEqual(error.exception.result["error_code"], "INVALID_DESKTOP_HUB")
+            build_opener.assert_not_called()
+            owners.return_value = {4000: 123}
+            self.assertTrue(callable(native_desktop.desktop_rpc("hub_4000.json")))
+            build_opener.assert_called_once()
+
+    def test_model_family_chooses_medium_or_explicit_tier(self):
+        records = {"clientModelConfigs": [
+            {"modelId": f"gemini-4-carbon-{tier}", "modelOrAlias": {"model": tier}}
+            for tier in ("low", "medium", "high")
+        ]}
+        self.assertEqual(resolve_model(records, "Carbon")[0], "gemini-4-carbon-medium")
+        self.assertEqual(resolve_model(records, "Carbon High")[0], "gemini-4-carbon-high")
+        self.assertEqual(resolve_model(records, "Gemini 4 Carbon", "high")[0], "gemini-4-carbon-high")
+        with self.assertRaises(NativeDesktopError) as error:
+            resolve_model(records, "Carbon", "max")
+        self.assertEqual(error.exception.result["error_code"], "NATIVE_MODEL_UNCONFIRMED")
 
     def test_static_conversation_without_mcp_is_not_verified(self):
         self.host.static_config = {"mcpServers": [], "codingAgent": {"agenticMode": False}}

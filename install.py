@@ -18,8 +18,10 @@ import time
 import tomllib
 from dataclasses import dataclass
 
+from bridge.antigravity_setup import MODEL_HOOK, inspect_setup
+
 SOURCE = Path(__file__).resolve().parent
-BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py", "native_desktop.py",
+BRIDGE_FILES = ("bridge_server.py", "headless_multi_engine.py", "notify_inbox.py", "agy_model_guard.py", "codex_projects.py", "native_desktop.py", "antigravity_setup.py",
                 "uia_driver.ps1", "uia_daemon.ps1", "BridgeFastUia.cs")
 AGY = "chatgpt-bridge"
 CODEX = "antigravity_bridge"
@@ -219,7 +221,7 @@ def antigravity_hook_edits(layout, python=None):
     path = layout.check_path(layout.antigravity_config.with_name("hooks.json"))
     original = read_bytes(path)
     hooks = load_json(original)
-    key = "codex-antigravity-bridge-model"
+    key = MODEL_HOOK
     script = str(layout.bridge / "agy_model_guard.py")
     current = hooks.get(key)
     owned = isinstance(current, dict) and any(
@@ -745,8 +747,8 @@ def doctor(layout):
             python = Path(registration["command"])
             pending_edits = antigravity_hook_edits(layout, python)
             hooks = layout.antigravity_config.with_name("hooks.json")
-            enabled_hook = load_json(read_bytes(hooks)).get("codex-antigravity-bridge-model", {}).get("enabled", True)
-            result("antigravity_model_hook", not pending_edits and enabled_hook, path=str(hooks))
+            setup = inspect_setup(layout.antigravity_config.parent, layout.bridge)
+            result("antigravity_model_hook", not pending_edits and setup["model_hook_installed"], path=str(hooks))
         except (OSError, ValueError, KeyError, TypeError) as error:
             result("antigravity_model_hook", False, error=type(error).__name__)
     dll = layout.check_path(layout.bridge / "BridgeFastUia.dll")
@@ -787,7 +789,10 @@ def doctor(layout):
         try:
             reply = exchange_mcp(entry, name, "tools/list")
             found = sorted(tool["name"] for tool in reply.get("tools", []))
-            result(f"{role}_mcp", set(found) == TOOLS[name], tools=found)
+            expected = TOOLS[name]
+            if role == "codex" and entry["env"].get("CODEX_AGY_EXPERIMENTAL_HUB", os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB")):
+                expected = expected | {"agy_provision_desktop_workspace", "agy_wake_desktop_workspace"}
+            result(f"{role}_mcp", set(found) == expected, tools=found)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             result(f"{role}_mcp", False, error=str(error))
     return {"ok": all(check["ok"] for check in checks.values()), "checks": checks}

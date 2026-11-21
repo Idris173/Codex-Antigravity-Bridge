@@ -43,6 +43,11 @@ from headless_multi_engine import (  # noqa: E402
     ui_inject_lock,
 )
 from codex_projects import ProjectError, ensure_project  # noqa: E402
+from antigravity_setup import inspect_setup  # noqa: E402
+if __package__:
+    from .native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace, resolve_model, wake_workspace_request
+else:
+    from native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace, resolve_model, wake_workspace_request
 
 PS_DRIVER = BASE_DIR / "uia_driver.ps1"
 PS_DAEMON = BASE_DIR / "uia_daemon.ps1"
@@ -667,7 +672,9 @@ def _update_first_title(lock: dict, snapshot: dict) -> Dict[str, Any]:
     return lock
 
 
-def tool_inspect_app() -> Dict[str, Any]:
+def tool_inspect_app(workspace_path: str = "") -> Dict[str, Any]:
+    if workspace_path:
+        return _bridge_diagnostics(workspace_path)
     res = _run_ps_driver(action="inspect", timeout_sec=20)
     store = _binding_store()
     active_bindings = store.list_bindings()
@@ -1200,12 +1207,16 @@ def tool_dispatch_status(dispatch_id: str) -> Dict[str, Any]:
     elif dispatch["repository_read_only"] and not dispatch["receipt_authorized"]:
         receipt["status"] = "not_authorized"
 
-    return {
-        "ok": True,
-        **dispatch,
-        "execution": _read_json_safe(_execution_path(dispatch_id)) or {"status": "awaiting_completion"},
-        "receipt": receipt,
-    }
+    execution = _read_json_safe(_execution_path(dispatch_id)) or {"status": "awaiting_completion"}
+    if receipt["status"] == "acknowledged":
+        phase = _phase_details("replied")
+    elif receipt["status"] == "queued":
+        phase = _phase_details("queued")
+    elif receipt["status"] == "not_authorized":
+        phase = _phase_details("not_authorized")
+    else:
+        phase = _phase_details(execution["status"])
+    return {"ok": True, **dispatch, "execution": execution, "receipt": receipt, **phase}
 
 
 def _reply_path(request_id: str) -> Path:
@@ -1255,25 +1266,55 @@ def _workspace_from_uri(uri: str) -> Optional[str]:
     return _existing_workspace(path)
 
 
-def _verify_local_project(project_id: str, workspace_key: str) -> None:
-    path = BASE_DIR.parent.parent / "projects" / f"{project_id}.json"
-    if not path.is_file():
-        return
-    project = _read_json_safe(path)
+def _local_projects_dir() -> Path:
+    return BASE_DIR.parent.parent / "projects"
+
+
+def _check_project_record(project, project_id: str, workspace_key: str) -> None:
     if not isinstance(project, dict) or str(project.get("id", "")).lower() != project_id:
         raise WorkspaceRouteError("ANTIGRAVITY_PROJECT_UNCONFIRMED")
     if "sidecar" in project or project.get("isWorkspaceOnly") is True:
         raise WorkspaceRouteError("ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN")
+    if project.get("archived") or project.get("backendType") not in (None, "BACKEND_TYPE_LOCAL"):
+        raise WorkspaceRouteError("ANTIGRAVITY_PROJECT_UNCONFIRMED")
     container = project.get("projectResources")
     resources = container.get("resources") if isinstance(container, dict) else None
-    if not isinstance(resources, list):
-        raise WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
-    for resource in resources:
-        uri = resource.get("folderUri") if isinstance(resource, dict) else None
-        root = _workspace_from_uri(uri) if isinstance(uri, str) else None
-        if root and os.path.normcase(root) == workspace_key:
-            return
+    if isinstance(resources, list):
+        for resource in resources:
+            uri = resource.get("folderUri") if isinstance(resource, dict) else None
+            root = _workspace_from_uri(uri) if isinstance(uri, str) else None
+            if root and os.path.normcase(root) == workspace_key:
+                return
     raise WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")
+
+
+def _verify_local_project(project_id: str, workspace_key: str) -> None:
+    path = _local_projects_dir() / f"{project_id}.json"
+    if path.is_file():
+        _check_project_record(_read_json_safe(path), project_id, workspace_key)
+
+
+def _discover_local_projects(workspace: str, project_name: str) -> Dict[str, Any]:
+    key = os.path.normcase(workspace)
+    candidates = []
+    for path in sorted(_local_projects_dir().glob("*.json")):
+        project_id = path.stem.lower()
+        if not PROJECT_ID.fullmatch(project_id):
+            continue
+        project = _read_json_safe(path)
+        try:
+            _check_project_record(project, project_id, key)
+        except WorkspaceRouteError:
+            continue
+        name = project.get("name")
+        if not isinstance(name, str) or not name or (project_name and name.casefold() != project_name.casefold()):
+            continue
+        candidates.append({"project_id": project_id, "project_name": name})
+    status = {0: "not_found", 1: "unique"}.get(len(candidates), "ambiguous")
+    result = {"ok": True, "workspace_path": workspace, "status": status, "projects": candidates}
+    if status == "unique":
+        result["project"] = candidates[0]
+    return result
 
 
 def _project_verified_route(route: Dict[str, Any]) -> bool:
@@ -1292,10 +1333,6 @@ def tool_provision_desktop_workspace(workspace_path: str, project_name: str, ses
         return {"ok": False, "error_code": "INVALID_PROJECT_NAME"}
     if session_key and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_key):
         return {"ok": False, "error_code": "INVALID_SESSION_KEY"}
-    if __package__:
-        from .native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace
-    else:
-        from native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace
     try:
         with _mutex(BUS_DIR / "desktop_provision.mutex"):
             return ensure_workspace(desktop_rpc(hub_name), Path(workspace), project_name.strip(), _workspace_from_uri, session_key)
@@ -1315,34 +1352,43 @@ def tool_wake_desktop_workspace(workspace_path: str, project_id: str, conversati
     if not (PROJECT_ID.fullmatch(project_id) and CONVERSATION_ID.fullmatch(conversation_id)
             and REQUEST_ID.fullmatch(request_id)):
         return {"ok": False, "error_code": "INVALID_NATIVE_REQUEST_TARGET"}
-    if __package__:
-        from .native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
-    else:
-        from native_desktop import NativeDesktopError, desktop_rpc, wake_workspace_request
+    project_id = project_id.lower()
     try:
         with _mutex(BUS_DIR / "desktop_provision.mutex"):
-            return wake_workspace_request(desktop_rpc(hub_name), Path(workspace), project_id, conversation_id,
-                                          request_id, model_id, _workspace_from_uri)
+            item = _pending_request(request_id)
+            if not item:
+                return {"ok": False, "error_code": "UNKNOWN_REQUEST_ID"}
+            if (item.get("target_project_id") != project_id or item.get("target_conversation_id") != conversation_id
+                    or os.path.normcase(item.get("workspace_path", "")) != os.path.normcase(workspace)):
+                return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_MISMATCH"}
+            return wake_workspace_request(
+                desktop_rpc(hub_name), Path(workspace), project_id, conversation_id,
+                request_id, model_id, _workspace_from_uri, required_model=item.get("required_model", ""),
+                before_send=lambda: _pending_request(request_id) is not None,
+            )
     except NativeDesktopError as error:
         return error.result
 
 
 
 def tool_workspace_pair(
-    action: str, workspace_path: str, conversation_id: str = "", project_id: str = "",
+    action: str, workspace_path: str, conversation_id: str = "", project_id: str = "", project_name: str = "",
 ) -> Dict[str, Any]:
     workspace = _existing_workspace(workspace_path)
     if workspace is None:
         return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
     key = os.path.normcase(workspace)
+    if action == "discover":
+        return _discover_local_projects(workspace, project_name.strip())
+    if action == "get":
+        route = _workspace_routes().get(key)
+        if route and route["status"] == "confirmed" and not _project_verified_route(route):
+            route = {**route, "status": "blocked", "error_code": "ANTIGRAVITY_PROJECT_UNCONFIRMED"}
+        return {"ok": True, "workspace_path": workspace, "route": route}
     path = BUS_DIR / "workspace_routes.json"
     with _mutex(path.with_suffix(".mutex")):
         routes = _workspace_routes()
         route = routes.get(key)
-        if action == "get":
-            if route and route["status"] == "confirmed" and not _project_verified_route(route):
-                route = {**route, "status": "blocked", "error_code": "ANTIGRAVITY_PROJECT_UNCONFIRMED"}
-            return {"ok": True, "workspace_path": workspace, "route": route}
         if action == "open":
             confirmed_project = route["project_id"] if route and _project_verified_route(route) else ""
             return {
@@ -1481,7 +1527,6 @@ def codex_cancel_guarded_review(request_id: str) -> Dict[str, Any]:
 
 
 def _pending_submissions() -> List[Dict[str, Any]]:
-    _ensure_bus_dir()
     pending: Dict[str, Dict[str, Any]] = {}
     candidates = [TO_AGY_FILE, *(BUS_DIR / "requests").glob("req_*.json")]
     for path in candidates:
@@ -1669,6 +1714,8 @@ def codex_tool_submit_for_review(
     dispatch_id: str = "",
     required_model: str = "",
     target_conversation_id: str = "",
+    model_effort: str = "",
+    auto_wake_blank: bool = False,
 ) -> Dict[str, Any]:
     dispatch = _load_dispatch(dispatch_id) if dispatch_id else None
     if dispatch_id and not dispatch:
@@ -1686,13 +1733,30 @@ def codex_tool_submit_for_review(
         route = _matching_workspace_route({"workspace_path": resolved_workspace}, _workspace_routes().values())
     if not dispatch and route and not _project_verified_route(route):
         return {"ok": False, "error_code": route.get("error_code", "ANTIGRAVITY_PROJECT_UNCONFIRMED")}
-    if required_model or target_conversation_id:
+    hub_name = os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB", "")
+    if auto_wake_blank:
+        if not hub_name:
+            return {"ok": False, "error_code": "NATIVE_DESKTOP_PROTOTYPE_DISABLED"}
+        if dispatch or not workspace_path or not route:
+            return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNCONFIRMED"}
+    if required_model or target_conversation_id or model_effort:
         if dispatch:
             return {"ok": False, "error_code": "MODEL_REQUIREMENT_NOT_SUPPORTED_FOR_DISPATCH_RECEIPTS"}
-        if not MODEL_ID.fullmatch(required_model):
+        if not required_model:
             return {"ok": False, "error_code": "INVALID_ANTIGRAVITY_MODEL"}
         if not workspace_path or not route or route["conversation_id"] != target_conversation_id:
             return {"ok": False, "error_code": "ANTIGRAVITY_TARGET_UNCONFIRMED"}
+        if hub_name:
+            try:
+                required_model, _ = resolve_model(
+                    desktop_rpc(hub_name)("GetCascadeModelConfigData", {}), required_model, model_effort
+                )
+            except NativeDesktopError as error:
+                return error.result
+        if not hub_name and (model_effort or not required_model.startswith(("gemini-", "claude-", "gpt-"))):
+            return {"ok": False, "error_code": "NATIVE_MODEL_CATALOG_UNAVAILABLE"}
+        if not MODEL_ID.fullmatch(required_model):
+            return {"ok": False, "error_code": "INVALID_ANTIGRAVITY_MODEL"}
 
     req_id = dispatch["request_id"] if dispatch else f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
     submission = {
@@ -1711,6 +1775,9 @@ def codex_tool_submit_for_review(
         submission.update(target_conversation_id=route["conversation_id"], target_project_id=route["project_id"])
     if required_model:
         submission["required_model"] = required_model
+    if auto_wake_blank:
+        submission["auto_wake_blank"] = True
+        submission["desktop_hub"] = hub_name
     if dispatch:
         queued = _queue_dispatch_receipt(dispatch, submission)
         if not queued["ok"]:
@@ -1724,9 +1791,10 @@ def codex_tool_submit_for_review(
             "message": "已投递至 Antigravity 技术总监收件箱（非阻塞模式）。稍后可调用 agy_fetch_director_reply 获取评审结论。",
         }
 
-    if not wait_for_reply or required_model:
-        return {**queued, **({"required_model": required_model, "target_conversation_id": target_conversation_id}
-                            if required_model else {})}
+    if not wait_for_reply or required_model or auto_wake_blank:
+        return {**queued, **_phase_details("queued"),
+                **({"required_model": required_model, "target_conversation_id": target_conversation_id}
+                   if required_model else {})}
 
     reply_file = _reply_path(req_id)
     deadline = time.monotonic() + max(5, min(int(wait_timeout_sec), 290))
@@ -1750,37 +1818,104 @@ def codex_tool_submit_for_review(
     }
 
 
-def codex_tool_fetch_director_reply(request_id: str = "") -> Dict[str, Any]:
+def _phase_details(phase: str, delivery: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    labels = {
+        "queued": ("已排队", "请求已保存，等待通知目标会话。"),
+        "notified": ("已通知", "宿主已接受通知，等待目标会话领取。"),
+        "claimed": ("已领取", "目标会话已领取，等待原单批复。"),
+        "model_verified": ("模型已核验", "宿主已核验模型，等待目标会话领取。"),
+        "replied": ("已批复", "原请求的批复已写回。"),
+        "cancelled": ("已取消", "请求已取消。"),
+        "blocked": ("已阻塞", "身份或模型核验未完成，请检查返回的阻塞原因。"),
+        "notification_failed": ("通知未确认", "请用桥接诊断检查目标路由和宿主。"),
+        "awaiting_completion": ("等待执行", "执行端尚未回报运行结果。"),
+        "running": ("执行中", "执行端正在处理任务。"),
+        "completed": ("执行完成", "执行端结果已返回。"),
+        "failed": ("执行失败", "请查看执行记录中的错误代码。"),
+        "not_authorized": ("回执未授权", "这次只读派发没有写回授权。"),
+        "empty": ("无批复", "当前没有可查收的批复。"),
+    }
+    delivery = delivery or {}
+    label, hint = labels.get(phase, ("待确认", "请查看返回的执行或投递状态。"))
+    error_code = delivery.get("error_code")
+    if error_code == "ANTIGRAVITY_MODEL_MISMATCH":
+        hint = f"当前模型为 {delivery.get('observed_model', '未知')}，所需模型为 {delivery.get('required_model', '未知')}。"
+    elif error_code == "ANTIGRAVITY_TARGET_MISMATCH":
+        hint = "当前项目或会话与原请求不符，请核对配对中的项目和会话 ID。"
+    elif error_code == "ANTIGRAVITY_SIDECAR_PROJECT_FORBIDDEN":
+        hint = "请配对正式原生项目，Sidecar 项目无法作为目标。"
+    elif error_code == "NATIVE_CONVERSATION_BUSY":
+        hint = "目标会话正在工作，Sidecar 会在后续轮询中重试。"
+    elif phase == "notified" and isinstance(delivery.get("notified_at"), str):
+        try:
+            age = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(delivery["notified_at"])).total_seconds()
+        except (ValueError, TypeError):
+            age = 0
+        if age >= 8:
+            hint = "目标尚未领取。若为实验性空白会话，可按同一 request_id 检查并补唤醒。"
+    if delivery.get("auto_wake_status") in ("failed", "starting") and not delivery.get("claimed_at"):
+        hint = "自动唤醒的结果未确认。先检查目标会话，再决定是否按同一 request_id 补唤醒。"
+    return {"phase_label": label, "user_hint": hint}
+
+
+def codex_tool_fetch_director_reply(request_id: str = "", *, include_phase: bool = True) -> Dict[str, Any]:
     req_id = (request_id or "").strip()
     if req_id:
         if not REQUEST_ID.fullmatch(req_id):
             return {"ok": False, "error_code": "INVALID_REQUEST_ID", "message": "request_id 格式无效。"}
         rep = _read_json_safe(_reply_path(req_id))
         if isinstance(rep, dict) and rep.get("request_id") == req_id:
-            if rep.get("required_model"):
-                return {**rep, "status": "replied", "delivery": _delivery_status(req_id)}
-            return rep
+            if not include_phase:
+                return rep
+            return {**rep, "status": "replied", "delivery": _delivery_status(req_id), **_phase_details("replied")}
         item = _pending_request(req_id)
         if item is None:
             record = _read_json_safe(_request_path(req_id))
             if record and record.get("status") == "cancelled":
-                return {"ok": True, "request_id": req_id, "status": "cancelled"}
+                return {"ok": True, "request_id": req_id, "status": "cancelled", **_phase_details("cancelled")}
             return {"ok": False, "request_id": req_id, "error_code": "UNKNOWN_REQUEST_ID"}
         delivery = _delivery_status(req_id)
         if item.get("required_model"):
             delivery = {"status": "queued", "required_model": item["required_model"],
                         "target_conversation_id": item["target_conversation_id"], **delivery}
         return {"ok": True, "request_id": req_id, "status": "pending", "delivery": delivery,
-                "message": f"请求 {req_id} 仍在等待批复。"}
+                "message": f"请求 {req_id} 仍在等待批复。", **_phase_details(delivery.get("status", "queued"), delivery)}
     latest = _read_json_safe(LATEST_TO_CODEX_FILE)
     if latest:
-        return latest
-    return {"ok": True, "status": "empty", "message": "当前尚无来自 Antigravity 的历史批复记录。"}
+        return {**latest, **_phase_details("replied")}
+    return {"ok": True, "status": "empty", "message": "当前尚无来自 Antigravity 的历史批复记录。",
+            **_phase_details("empty")}
 
 
-def codex_tool_bridge_status() -> Dict[str, Any]:
+def _bridge_diagnostics(workspace_path: str = "") -> Dict[str, Any]:
+    result = {"ok": True, **inspect_setup(BASE_DIR.parent.parent, BASE_DIR)}
+    if workspace_path:
+        workspace = _existing_workspace(workspace_path)
+        if workspace is None:
+            return {"ok": False, "error_code": "WORKSPACE_NOT_FOUND"}
+        route = _matching_workspace_route({"workspace_path": workspace}, _workspace_routes().values())
+        result.update(workspace_path=workspace, route_status=route.get("status") if route else "unpaired")
+        if route:
+            result["route"] = {key: route[key] for key in ("project_id", "conversation_id", "error_code") if key in route}
+            if result["route_status"] == "confirmed" and not _project_verified_route(route):
+                result["route_status"] = "blocked"
+                result["route"]["error_code"] = "ANTIGRAVITY_PROJECT_UNCONFIRMED"
+    hub_name = os.environ.get("CODEX_AGY_EXPERIMENTAL_HUB", "")
+    result.update(experimental_hub_enabled=bool(hub_name), experimental_hub_reachable=False)
+    if hub_name:
+        try:
+            desktop_rpc(hub_name)("ListProjects", {})
+            result["experimental_hub_reachable"] = True
+        except NativeDesktopError as error:
+            result["experimental_hub_error"] = error.result["error_code"]
+    return result
+
+
+def codex_tool_bridge_status(workspace_path: str = "") -> Dict[str, Any]:
+    if workspace_path:
+        return _bridge_diagnostics(workspace_path)
     return {
-        "ok": True,
+        **_bridge_diagnostics(),
         "bus_dir": str(BUS_DIR),
         "antigravity_session_lock": _load_lock(),
         "pending_inbox": tool_check_codex_inbox(),
@@ -1837,10 +1972,10 @@ AGY_MCP_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "bridge_inspect_app",
         "description": (
-            "门禁检测工具：检查本机 ChatGPT 桌面应用是否已开启，读取当前激活会话标题、"
+            "传入 workspace_path 执行只读 MCP 诊断。省略时：检查本机 ChatGPT 桌面应用是否已开启，读取当前激活会话标题、"
             "侧边栏全部工程/会话列表、最近对话摘要及当前锁状态。"
         ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {"type": "object", "properties": {"workspace_path": {"type": "string"}}, "additionalProperties": False},
     },
     {
         "name": "bridge_bind_session",
@@ -1963,10 +2098,11 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
     _routing_tool("agy_routing_settings"),
     {
         "name": "agy_workspace_pair",
-        "description": "按真实目录和原生项目 ID 配对已有 Antigravity 会话。link 需提供 project_id 与 conversation_id，get 查询宿主核验结果。open 返回原生项目会话要求。",
+        "description": "按真实目录和原生项目 ID 配对已有 Antigravity 会话。discover 按绝对目录查找项目，link 登记会话，get 查询核验结果，open 返回会话要求。",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["get", "link", "open"]},
+            "action": {"type": "string", "enum": ["get", "link", "open", "discover"]},
             "workspace_path": {"type": "string"},
+            "project_name": {"type": "string", "description": "可选。仅 discover 使用。"},
             "conversation_id": {"type": "string"},
             "project_id": {"type": "string", "description": "从预期 Antigravity 原生项目独立取得的项目 UUID。"},
         }, "required": ["action", "workspace_path"], "additionalProperties": False},
@@ -2004,7 +2140,9 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
                     "description": "是否阻塞等待 Antigravity 实时写回评审结论（默认 true）。",
                 },
                 "dispatch_id": {"type": "string", "description": "可选。对应普通派发的 DISPATCH_ID。"},
-                "required_model": {"type": "string", "description": "必须执行本请求的 Antigravity 模型，由宿主钩子校验。"},
+                "required_model": {"type": "string", "description": "Antigravity 模型，由宿主钩子校验。启用实验目录时可传家族或简称。"},
+                "model_effort": {"type": "string", "description": "可选的模型档位，使用本机 Antigravity 模型目录解析。"},
+                "auto_wake_blank": {"type": "boolean", "description": "实验性选项。对已确认路由的空白会话自动唤醒一次。"},
                 "target_conversation_id": {"type": "string", "description": "已按工作区验证的 Antigravity 会话 ID。"},
                 "wait_timeout_sec": {
                     "type": "integer",
@@ -2043,7 +2181,7 @@ CODEX_MCP_TOOLS: List[Dict[str, Any]] = [
             "idempotentHint": True,
             "openWorldHint": False,
         },
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {"type": "object", "properties": {"workspace_path": {"type": "string"}}, "additionalProperties": False},
     },
 ]
 
@@ -2135,7 +2273,7 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
         dispatch = _load_dispatch(receipt_scope)
         if not dispatch or args.get("request_id", dispatch["request_id"]) != dispatch["request_id"]:
             return {"ok": False, "error_code": "DISPATCH_SCOPE_MISMATCH"}
-        return codex_tool_fetch_director_reply(dispatch["request_id"])
+        return codex_tool_fetch_director_reply(dispatch["request_id"], include_phase=False)
 
     tools = CODEX_MCP_TOOLS if role == "codex" else AGY_MCP_TOOLS
     arg_err = _validate_args(tools, name, args)
@@ -2169,15 +2307,17 @@ def _dispatch_mcp_tool(role: str, name: str, args: Dict[str, Any], receipt_scope
                 dispatch_id=args.get("dispatch_id") or os.environ.get("CODEX_BRIDGE_DISPATCH_ID", ""),
                 required_model=args.get("required_model", ""),
                 target_conversation_id=args.get("target_conversation_id", ""),
+                model_effort=args.get("model_effort", ""),
+                auto_wake_blank=args.get("auto_wake_blank", False),
             )
         if name == "agy_fetch_director_reply":
             return codex_tool_fetch_director_reply(request_id=args.get("request_id", ""))
         if name == "agy_bridge_status":
-            return codex_tool_bridge_status()
+            return codex_tool_bridge_status(**args)
         return {"ok": False, "error_code": "UNKNOWN_CODEX_TOOL", "message": f"未知 Codex 侧工具: {name}"}
 
     if name == "bridge_inspect_app":
-        return tool_inspect_app()
+        return tool_inspect_app(**args)
     if name == "bridge_codex_session_model":
         return tool_codex_session_model(**args)
     if name == "bridge_bind_session":

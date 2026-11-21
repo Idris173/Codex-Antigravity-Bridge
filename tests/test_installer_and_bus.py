@@ -391,6 +391,207 @@ class BridgeLogicTests(TemporaryHomeTest):
         patches.start()
         self.addCleanup(patches.stop)
 
+    def test_discover_lists_only_native_projects_for_exact_workspace(self):
+        workspace = self.layout.home
+        directory = self.bridge.BASE_DIR.parent.parent / "projects"
+        original = "11111111-1111-4111-8111-111111111111"
+        alternate = "22222222-2222-4222-8222-222222222222"
+        sidecar = "33333333-3333-4333-8333-333333333333"
+
+        def project(project_id, name, **fields):
+            self.bridge._atomic_write_json(directory / f"{project_id}.json", {
+                "id": project_id, "name": name,
+                "projectResources": {"resources": [{"folderUri": workspace.as_uri()}]}, **fields,
+            })
+
+        project(original, "Pilot")
+        project(sidecar, "Sidecar", sidecar={"sidecarId": "bridge"})
+        self.assertEqual(self.bridge.tool_workspace_pair("discover", str(workspace))["project"]["project_id"], original)
+        project(alternate, "Other")
+        result = self.bridge.tool_workspace_pair("discover", str(workspace))
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual([project["project_id"] for project in result["projects"]], [original, alternate])
+        result = self.bridge.tool_workspace_pair("discover", str(workspace), project_name="pilot")
+        self.assertEqual(result["project"]["project_id"], original)
+        self.assertFalse(self.bridge.BUS_DIR.exists())
+
+    def _usability_route(self):
+        bridge = self.bridge
+        workspace = str(self.layout.home)
+        project = "11111111-1111-4111-8111-111111111111"
+        conversation = "22222222-2222-4222-8222-222222222222"
+        route = {"workspace_path": workspace, "project_id": project, "expected_project_id": project,
+                 "conversation_id": conversation, "status": "confirmed", "since_ms": 0}
+        bridge._atomic_write_json(bridge.BUS_DIR / "workspace_routes.json", {os.path.normcase(workspace): route})
+        return route
+
+    def test_auto_wake_uses_exact_model_on_same_request_only_once(self):
+        from bridge import notify_inbox
+
+        bridge = self.bridge
+        route = self._usability_route()
+        catalog = {"clientModelConfigs": [
+            {"modelId": "gemini-4-carbon-medium", "modelOrAlias": {"model": "TEST_MEDIUM"}},
+            {"modelId": "gemini-4-carbon-high", "modelOrAlias": {"model": "TEST_HIGH"}},
+        ]}
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": "auto"}), \
+                mock.patch.object(bridge, "desktop_rpc", return_value=mock.Mock(return_value=catalog)):
+            submitted = bridge.codex_tool_submit_for_review(
+                "Work", workspace_path=route["workspace_path"],
+                target_conversation_id=route["conversation_id"], required_model="Carbon",
+                model_effort="high", auto_wake_blank=True, wait_for_reply=False,
+            )
+        req = submitted["request_id"]
+        self.assertEqual(submitted["required_model"], "gemini-4-carbon-high")
+        self.assertEqual(submitted["phase_label"], "已排队")
+        before = bridge._request_path(req).read_bytes()
+        self.assertEqual(bridge.codex_tool_fetch_director_reply(req)["phase_label"], "已排队")
+        self.assertEqual(bridge._request_path(req).read_bytes(), before)
+        self.assertFalse(bridge._delivery_path(req).exists())
+
+        def send(*args, before_send, **options):
+            self.assertTrue(before_send())
+            return {"status": "sent"}
+
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox), \
+                mock.patch.object(notify_inbox, "_verify_native_route"), \
+                mock.patch.object(notify_inbox, "desktop_rpc") as rpc, \
+                mock.patch.object(notify_inbox, "wake_workspace_request", side_effect=send) as wake, \
+                mock.patch.object(notify_inbox, "native_call") as normal, redirect_stdout(io.StringIO()):
+            args = (route["workspace_path"], route["conversation_id"], 0, "agentapi")
+            self.assertEqual(notify_inbox.notify_pending(*args), req)
+            self.assertIsNone(notify_inbox.notify_pending(*args))
+            self.assertEqual(wake.call_count, 1)
+            self.assertEqual(wake.call_args.args[4], req)
+            self.assertEqual(wake.call_args.kwargs["required_model"], "gemini-4-carbon-high")
+            self.assertTrue(wake.call_args.kwargs["blank_only"])
+            rpc.assert_called_once_with("auto")
+            normal.assert_not_called()
+        reply = bridge.codex_tool_fetch_director_reply(req)
+        self.assertEqual(reply["phase_label"], "已通知")
+        self.assertEqual(reply["delivery"]["auto_wake_status"], "sent")
+
+    def test_auto_wake_failure_is_not_resent_by_notifier(self):
+        from bridge import notify_inbox
+        from bridge.native_desktop import NativeDesktopError
+
+        bridge = self.bridge
+        route = self._usability_route()
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": "auto"}):
+            sent = bridge.codex_tool_submit_for_review(
+                "Work", workspace_path=route["workspace_path"], auto_wake_blank=True, wait_for_reply=False,
+            )
+        def unknown_send(*args, before_send, **options):
+            self.assertTrue(before_send())
+            raise NativeDesktopError("NATIVE_DESKTOP_RPC_UNCONFIRMED", "SendUserCascadeMessage")
+
+        with mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                 tool_check_codex_inbox=bridge.tool_check_codex_inbox), \
+                mock.patch.object(notify_inbox, "_verify_native_route"), \
+                mock.patch.object(notify_inbox, "desktop_rpc") as rpc, \
+                mock.patch.object(notify_inbox, "wake_workspace_request", side_effect=unknown_send), \
+                mock.patch.object(notify_inbox, "native_call") as normal:
+            for _ in range(2):
+                self.assertIsNone(notify_inbox.notify_pending(route["workspace_path"], route["conversation_id"], 0, "agentapi"))
+            rpc.assert_called_once()
+            normal.assert_not_called()
+        outcome = bridge.codex_tool_fetch_director_reply(sent["request_id"])
+        self.assertEqual(outcome["delivery"]["auto_wake_status"], "failed")
+        self.assertEqual(outcome["delivery"]["error_code"], "NATIVE_DESKTOP_RPC_UNCONFIRMED")
+
+    def test_auto_wake_retries_read_only_preflight_or_normal_notification_failure(self):
+        from bridge import notify_inbox
+        from bridge.native_desktop import NativeDesktopError
+
+        bridge = self.bridge
+        route = self._usability_route()
+        busy = NativeDesktopError("NATIVE_CONVERSATION_BUSY", "GetCascadeTrajectory")
+        success = {"sendMessage": {"recipientId": route["conversation_id"]}}
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": "auto"}), \
+                mock.patch.multiple(notify_inbox, BUS_DIR=bridge.BUS_DIR, bridge=bridge,
+                                    tool_check_codex_inbox=bridge.tool_check_codex_inbox), \
+                mock.patch.object(notify_inbox, "_verify_native_route"), \
+                mock.patch.object(notify_inbox, "desktop_rpc"), redirect_stdout(io.StringIO()):
+            args = (route["workspace_path"], route["conversation_id"], 0, "agentapi")
+            for preflight, notify_error in ((busy, None), ({"status": "not_blank"}, OSError("not ready"))):
+                with self.subTest(preflight=preflight):
+                    submitted = bridge.codex_tool_submit_for_review(
+                        "Work", workspace_path=route["workspace_path"], auto_wake_blank=True, wait_for_reply=False,
+                    )
+                    req = submitted["request_id"]
+                    first_notification = [notify_error] if notify_error else []
+                    with mock.patch.object(notify_inbox, "wake_workspace_request",
+                                           side_effect=[preflight, {"status": "not_blank"}]), \
+                            mock.patch.object(notify_inbox, "native_call", side_effect=[*first_notification, success]):
+                        self.assertIsNone(notify_inbox.notify_pending(*args))
+                        delivery = bridge.codex_tool_fetch_director_reply(req)["delivery"]
+                        self.assertNotIn("auto_wake_started_at", delivery)
+                        self.assertEqual(delivery["status"], "notification_failed")
+                        self.assertEqual(notify_inbox.notify_pending(*args), req)
+
+    def test_manual_wake_matches_original_request_target_and_inherits_model(self):
+        bridge = self.bridge
+        route = self._usability_route()
+        workspace = route["workspace_path"]
+        project = route["project_id"]
+        conversation = route["conversation_id"]
+        model = "gemini-4-carbon-high"
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": ""}):
+            for alias in ("carbon", "carbon-high"):
+                invalid = bridge.codex_tool_submit_for_review(
+                    "Work", workspace_path=workspace, target_conversation_id=conversation,
+                    required_model=alias, wait_for_reply=False,
+                )
+                self.assertEqual(invalid["error_code"], "NATIVE_MODEL_CATALOG_UNAVAILABLE")
+            queued = bridge.codex_tool_submit_for_review(
+                "Work", workspace_path=workspace, target_conversation_id=conversation,
+                required_model=model, wait_for_reply=False,
+            )
+        req = queued["request_id"]
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": "auto"}), \
+                mock.patch.object(bridge, "desktop_rpc") as rpc, \
+                mock.patch.object(bridge, "wake_workspace_request", return_value={"status": "sent"}) as wake:
+            unknown = bridge.tool_wake_desktop_workspace(workspace, project, conversation, "req_1_abcdef")
+            self.assertEqual(unknown["error_code"], "UNKNOWN_REQUEST_ID")
+            wrong = bridge.tool_wake_desktop_workspace(workspace, project, "33333333-3333-4333-8333-333333333333", req)
+            self.assertEqual(wrong["error_code"], "ANTIGRAVITY_TARGET_MISMATCH")
+            rpc.assert_not_called()
+            result = bridge.tool_wake_desktop_workspace(workspace, project.upper(), conversation, req)
+            self.assertEqual(result["status"], "sent")
+            self.assertEqual(wake.call_args.args[2:6], (project, conversation, req, ""))
+            self.assertEqual(wake.call_args.kwargs["required_model"], model)
+
+    def test_mcp_diagnostics_do_not_require_ui_or_write_configuration(self):
+        bridge = self.bridge
+        route = self._usability_route()
+        config = bridge.BASE_DIR.parent.parent
+        self.seed(config / "config.json", b'{"sidecars":{"chatgpt-bridge":{"enabled":true}}}')
+        self.seed(bridge.BASE_DIR / "notify_inbox.py", b"")
+        manifest = {"command": "python", "args": [str(bridge.BASE_DIR / "notify_inbox.py")]}
+        self.seed(bridge.BASE_DIR / "sidecar.json", json.dumps(manifest).encode())
+        hook_script = bridge.BASE_DIR / "agy_model_guard.py"
+        self.seed(hook_script, b"")
+        invoke = f'python "{hook_script}" pre-invocation'
+        tool = f'python "{hook_script}" pre-tool'
+        hooks = {"codex-antigravity-bridge-model": {
+            "PreInvocation": [{"command": invoke}],
+            "PreToolUse": [{"matcher": ".*", "hooks": [{"command": tool}]}],
+        }}
+        self.seed(config / "hooks.json", json.dumps(hooks).encode())
+        with mock.patch.dict(os.environ, {"CODEX_AGY_EXPERIMENTAL_HUB": ""}), \
+                mock.patch.object(bridge, "_run_ps_driver") as ui, mock.patch.object(bridge, "desktop_rpc") as rpc:
+            worker = bridge._dispatch_mcp_tool("codex", "agy_bridge_status", {"workspace_path": route["workspace_path"]})
+            director = bridge._dispatch_mcp_tool("antigravity", "bridge_inspect_app", {"workspace_path": route["workspace_path"]})
+        ui.assert_not_called()
+        rpc.assert_not_called()
+        self.assertEqual(worker, director)
+        self.assertTrue(worker["sidecar_enabled"])
+        self.assertTrue(worker["model_hook_installed"])
+        self.assertEqual(worker["route_status"], "confirmed")
+        self.assertFalse(worker["experimental_hub_reachable"])
+        self.assertNotIn("command", json.dumps(worker))
+
     def test_notifications_retry_and_only_notify_new_messages_for_bound_workspace(self):
         from bridge import notify_inbox
 

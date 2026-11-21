@@ -1,24 +1,12 @@
 """Authorize paired bridge tool calls using Antigravity's native hook metadata."""
 
 import json
-import re
 import sys
 import time
 import uuid
 
 import bridge_server as bridge
-
-
-def model_matches(expected, observed):
-    if not isinstance(observed, str):
-        return False
-    if observed == expected:
-        return True
-    return bool(re.fullmatch(r"gemini-4-[a-z0-9]+", expected)) and any(
-        observed == f"{expected}-{suffix}"
-        for suffix in ("low", "medium", "high", "extra", "max", "tiered-low",
-                       "tiered-medium", "tiered-high", "tiered-extra", "tiered-max")
-    )
+from native_desktop import model_matches
 
 
 def _observe(item, state, observed):
