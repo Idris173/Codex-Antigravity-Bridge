@@ -45,9 +45,13 @@ from headless_multi_engine import (  # noqa: E402
 from codex_projects import ProjectError, ensure_project  # noqa: E402
 from antigravity_setup import inspect_setup  # noqa: E402
 if __package__:
-    from .native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace, resolve_model, wake_workspace_request
+    from .native_desktop import (
+        NativeDesktopError, desktop_rpc, ensure_workspace, project_resource_folder_uri, resolve_model, wake_workspace_request,
+    )
 else:
-    from native_desktop import NativeDesktopError, desktop_rpc, ensure_workspace, resolve_model, wake_workspace_request
+    from native_desktop import (
+        NativeDesktopError, desktop_rpc, ensure_workspace, project_resource_folder_uri, resolve_model, wake_workspace_request,
+    )
 
 PS_DRIVER = BASE_DIR / "uia_driver.ps1"
 PS_DAEMON = BASE_DIR / "uia_daemon.ps1"
@@ -1281,8 +1285,8 @@ def _check_project_record(project, project_id: str, workspace_key: str) -> None:
     resources = container.get("resources") if isinstance(container, dict) else None
     if isinstance(resources, list):
         for resource in resources:
-            uri = resource.get("folderUri") if isinstance(resource, dict) else None
-            root = _workspace_from_uri(uri) if isinstance(uri, str) else None
+            uri = project_resource_folder_uri(resource)
+            root = _workspace_from_uri(uri) if uri is not None else None
             if root and os.path.normcase(root) == workspace_key:
                 return
     raise WorkspaceRouteError("ANTIGRAVITY_WORKSPACE_UNCONFIRMED")

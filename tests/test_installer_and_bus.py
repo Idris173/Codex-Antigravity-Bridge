@@ -241,6 +241,45 @@ name = "Existing"
         self.assertEqual(dll.read_bytes(), original)
         self.assertFalse(list(self.layout.bridge.glob(".compile-*")))
 
+    def test_sidebar_project_action_accepts_only_the_exact_inline_button(self):
+        self.cli()
+        script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+[void][Reflection.Assembly]::Load([IO.File]::ReadAllBytes($env:BRIDGE_TEST_UIA_DLL))
+$flags = [Reflection.BindingFlags]'Static, NonPublic'
+$projectCandidate = [BridgeFastUia].GetMethod('IsProjectActionCandidate', $flags)
+$sidebarCandidate = [BridgeFastUia].GetMethod('IsSidebarCandidate', $flags)
+$window = [Windows.Rect]::new(237, -2288, 2757, 1703)
+$row = [Windows.Rect]::new(327, -1451, 381, 45)
+$action = [Windows.Rect]::new(717, -1443, 31, 31)
+$sidebarX = [double]1081
+$name = 'Start new chat in FD_Env'
+[string[]]$names = @($name, 'New chat in FD_Env')
+
+function Test-ProjectAction($rect, [bool]$enabled, [string]$actualName) {
+    $projectCandidate.Invoke($null, [object[]]@($rect, $row, $window, $sidebarX, $enabled, $actualName, $names))
+}
+
+@{
+    visible_row = $sidebarCandidate.Invoke($null, [object[]]@($row, $window, $sidebarX, $false, $true))
+    offscreen_row = $sidebarCandidate.Invoke($null, [object[]]@($row, $window, $sidebarX, $true, $true))
+    narrow_sidebar_item = $sidebarCandidate.Invoke($null, [object[]]@($action, $window, $sidebarX, $false, $true))
+    narrow_project_action = Test-ProjectAction $action $true $name
+    disabled_project_action = Test-ProjectAction $action $false $name
+    other_project = Test-ProjectAction $action $true ($name + '_2')
+    generic_action = Test-ProjectAction $action $true 'New chat'
+    zero_width = Test-ProjectAction ([Windows.Rect]::new(717, -1443, 0, 31)) $true $name
+    zero_height = Test-ProjectAction ([Windows.Rect]::new(717, -1443, 31, 0)) $true $name
+    outside_sidebar = Test-ProjectAction ([Windows.Rect]::new(1100, -1443, 31, 31)) $true $name
+    outside_project_row = Test-ProjectAction ([Windows.Rect]::new(717, -1380, 31, 31)) $true $name
+} | ConvertTo-Json -Compress
+"""
+        dll = self.layout.bridge / "BridgeFastUia.dll"
+        result = install.run_powershell(script, {"BRIDGE_TEST_UIA_DLL": str(dll)})
+        cases = json.loads(result.stdout)
+        self.assertEqual({name for name, passed in cases.items() if passed}, {"visible_row", "narrow_project_action"})
+
     def test_warm_driver_keeps_invalid_window_target_across_actions(self):
         self.cli()
         module = runpy.run_path(str(self.layout.server))
@@ -407,7 +446,7 @@ class BridgeLogicTests(TemporaryHomeTest):
         project(original, "Pilot")
         project(sidecar, "Sidecar", sidecar={"sidecarId": "bridge"})
         self.assertEqual(self.bridge.tool_workspace_pair("discover", str(workspace))["project"]["project_id"], original)
-        project(alternate, "Other")
+        project(alternate, "Other", projectResources={"resources": [{"gitFolder": {"folderUri": workspace.as_uri()}}]})
         result = self.bridge.tool_workspace_pair("discover", str(workspace))
         self.assertEqual(result["status"], "ambiguous")
         self.assertEqual([project["project_id"] for project in result["projects"]], [original, alternate])

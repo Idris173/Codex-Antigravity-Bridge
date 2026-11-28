@@ -44,7 +44,7 @@ class DesktopHost:
                 "rootConversationId": cid,
                 "staticConfig": self.static_config,
                 "projectId": str(uuid4()) if self.wrong_project else project_id,
-                "workspaceUris": [resource["folderUri"] for resource in resources],
+                "workspaceUris": [resource.get("gitFolder", resource)["folderUri"] for resource in resources],
             }
             return {"cascadeId": cid}
         if method == "GetCascadeTrajectory":
@@ -89,6 +89,8 @@ class DesktopProvisionTests(unittest.TestCase):
 
     def test_new_session_key_keeps_same_project(self):
         original = self.provision()
+        resources = self.host.projects[original["project_id"]]["projectResources"]["resources"]
+        resources[0] = {"gitFolder": resources[0]}
         extra = self.provision(session_key="carbon")
         self.assertEqual(extra["project_id"], original["project_id"])
         self.assertNotEqual(extra["conversation_id"], original["conversation_id"])

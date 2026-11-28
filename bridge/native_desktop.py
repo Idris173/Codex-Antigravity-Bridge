@@ -123,6 +123,15 @@ def desktop_rpc(hub_name):
     return _hub_rpc(directory / hub_name, _desktop_loopback_owners())
 
 
+def project_resource_folder_uri(resource):
+    if not isinstance(resource, dict):
+        return None
+    uri = resource.get("folderUri")
+    if uri is None and isinstance(resource.get("gitFolder"), dict):
+        uri = resource["gitFolder"].get("folderUri")
+    return uri if isinstance(uri, str) else None
+
+
 def resolve_model(catalog, requested="", effort=""):
     """Resolve the host's exact model ID and wire enum. The runtime hook still verifies both calls."""
     if not requested and not effort:
@@ -195,8 +204,8 @@ def ensure_workspace(call, workspace, name, path_from_uri, session_key=""):
         container = project.get("projectResources")
         resources = container.get("resources") if isinstance(container, dict) else None
         return (
-            isinstance(resources, list) and len(resources) == 1 and isinstance(resources[0], dict)
-            and matches_workspace([resources[0].get("folderUri")])
+            isinstance(resources, list) and len(resources) == 1
+            and matches_workspace([project_resource_folder_uri(resources[0])])
         )
 
     def read_conversation(conversation_id):

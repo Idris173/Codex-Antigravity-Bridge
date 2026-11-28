@@ -38,7 +38,7 @@ if ($null -eq $loadedUiaType) {
         Add-Type -Path $csPath -ReferencedAssemblies "UIAutomationClient","UIAutomationTypes","WindowsBase","System.Core" -OutputAssembly $dllPath
         [void][System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($dllPath))
     }
-} elseif ($null -eq $loadedUiaType.GetMethod("RestoreWithoutActivation")) {
+} elseif ($null -eq $loadedUiaType.GetMethod("InvokeProjectNewChat")) {
     # Self-heal when invoked inside a pre-upgrade uia_daemon.ps1 AppDomain holding an older BridgeFastUia type
     $childArgs = @(
         "-Sta", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath,
@@ -320,12 +320,19 @@ if ($Action -in @("new_project_session", "switch_session")) {
           "New chat in $ProjectName", "Create new chat in $ProjectName")
     } else { @($SessionName) }
 
+    function Invoke-TargetSidebarAction($Snapshot) {
+        if ($inProject) {
+            return [BridgeFastUia]::InvokeProjectNewChat($targetWin.Element, $Snapshot._sidebar_x, $ProjectName, $names)
+        }
+        return [BridgeFastUia]::InvokeSidebarItem($targetWin.Element, $Snapshot._sidebar_x, $false, $names)
+    }
+
     $snap = Build-Snapshot $targetWin $false
-    $clicked = [BridgeFastUia]::InvokeSidebarItem($targetWin.Element, $snap._sidebar_x, $inProject, $names)
+    $clicked = Invoke-TargetSidebarAction $snap
     if ($null -eq $clicked -and [BridgeFastUia]::TryExpandSidebar($targetWin.Element)) {
         Start-Sleep -Milliseconds 300
         $snap = Build-Snapshot $targetWin $false
-        $clicked = [BridgeFastUia]::InvokeSidebarItem($targetWin.Element, $snap._sidebar_x, $inProject, $names)
+        $clicked = Invoke-TargetSidebarAction $snap
     }
     if ($null -ne $clicked) {
         Start-Sleep -Milliseconds 500

@@ -354,6 +354,56 @@ public static class BridgeFastUia {
         return InvokeNavigation(win, sidebarX, projectAction, names);
     }
 
+    private static bool IsProjectActionCandidate(Rect action, Rect row, Rect window, double sidebarX, bool enabled,
+                                                 string name, string[] names) {
+        // Chromium reports unhovered project actions as offscreen even though their parent row is visible.
+        return enabled && action.Width > 0 && action.Height > 0 &&
+            action.Left >= window.Left && action.Right <= Math.Min(window.Right, Math.Max(sidebarX + 20, row.Right + 20)) &&
+            action.Top >= Math.Max(window.Top, row.Top - 8) && action.Bottom <= Math.Min(window.Bottom, row.Bottom + 8) &&
+            Array.Exists(names, candidate => string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static string InvokeProjectNewChat(AutomationElement win, double sidebarX, string projectName, params string[] names) {
+        if (string.IsNullOrWhiteSpace(projectName)) return null;
+
+        var cache = new CacheRequest();
+        cache.Add(AutomationElement.NameProperty);
+        cache.Add(AutomationElement.BoundingRectangleProperty);
+        cache.Add(AutomationElement.IsOffscreenProperty);
+        cache.Add(AutomationElement.IsEnabledProperty);
+        cache.TreeScope = TreeScope.Element;
+
+        Rect window = win.Current.BoundingRectangle;
+        InvokePattern target = null;
+        string targetName = null;
+        using (cache.Activate()) {
+            foreach (AutomationElement row in win.FindAll(TreeScope.Descendants, SidebarControl)) {
+                try {
+                    if (!string.Equals((row.Cached.Name ?? "").Trim(), projectName, StringComparison.OrdinalIgnoreCase)) continue;
+                    Rect rowRect = row.Cached.BoundingRectangle;
+                    if (!IsSidebarCandidate(rowRect, window, sidebarX, row.Cached.IsOffscreen, row.Cached.IsEnabled)) continue;
+
+                    foreach (AutomationElement button in row.FindAll(TreeScope.Descendants, SidebarControl)) {
+                        try {
+                            string name = (button.Cached.Name ?? "").Trim();
+                            if (!IsProjectActionCandidate(button.Cached.BoundingRectangle, rowRect, window, sidebarX,
+                                                          button.Cached.IsEnabled, name, names)) continue;
+                            object pattern;
+                            if (!button.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) continue;
+                            if (target != null) return null;
+                            target = (InvokePattern)pattern;
+                            targetName = name;
+                        } catch (ElementNotAvailableException) { }
+                    }
+                } catch (ElementNotAvailableException) { }
+            }
+        }
+
+        if (target == null) return null;
+        target.Invoke();
+        return targetName;
+    }
+
     private static string InvokeNavigation(AutomationElement win, double? sidebarX, bool projectAction, params string[] names) {
         var cr = new CacheRequest();
         cr.Add(AutomationElement.NameProperty);
